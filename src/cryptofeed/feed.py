@@ -606,16 +606,6 @@ class DeltaFeed(ExchangeFeed):
                                     bids_raw=norm.get("bids_raw"),
                                     asks_raw=norm.get("asks_raw"))
             if ok:
-                expected_cs = norm.get("cs", 0)
-                if expected_cs != 0:
-                    actual_cs = book.calculate_checksum(n_levels=10)
-                    if actual_cs != expected_cs:
-                        logger.warning(f"Delta {symbol}: snapshot checksum mismatch, "
-                                     f"seq={norm['update_id']}, expected_cs={expected_cs}, "
-                                     f"actual_cs={actual_cs}. Resubscribing...")
-                        self._synced[symbol] = False
-                        asyncio.create_task(self._resubscribe(symbol))
-                        return
                 self._last_seq[symbol] = norm["update_id"]
                 self._synced[symbol] = True
                 logger.info(f"Delta {symbol} snapshot loaded, seq={norm['update_id']}, "
@@ -662,16 +652,6 @@ class DeltaFeed(ExchangeFeed):
             self._synced[symbol] = False
             asyncio.create_task(self._resubscribe(symbol))
             return
-
-        expected_cs = norm.get("cs", 0)
-        if expected_cs != 0:
-            actual_cs = book.calculate_checksum(n_levels=10)
-            if actual_cs != expected_cs:
-                logger.warning(f"Delta {symbol}: checksum mismatch, seq={actual_seq}, "
-                             f"expected_cs={expected_cs}, actual_cs={actual_cs}. Resubscribing...")
-                self._synced[symbol] = False
-                asyncio.create_task(self._resubscribe(symbol))
-                return
 
         self._last_seq[symbol] = actual_seq
 
