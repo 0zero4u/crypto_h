@@ -1,7 +1,7 @@
 # crypto-hft-infra
 
 **Async WebSocket market data feed + cross-exchange divergence strategy**  
-Binance · Bybit · Gate.io · DWMP · Z-Score signals
+Binance · Bybit · Gate.io · Delta Exchange · DWMP · Z-Score signals
 
 [![CI](https://github.com/abRH/crypto-hft-infra/actions/workflows/ci.yml/badge.svg)](https://github.com/abRH/crypto-hft-infra/actions)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
@@ -20,9 +20,12 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 │  Binance (fstream.binance.com) ──► BinanceFeed ──► Normalizer ──► L2Book   │
 │  Bybit (stream.bybit.com/v5/public/linear) ──► BybitFeed ──► Normalizer    │
 │  Gate.io (fx-ws.gateio.ws/v4/ws/usdt) ──► GateIoFeed ──► Normalizer        │
+│  Delta (public-socket.india.delta.exchange) ──► DeltaFeed ──► Normalizer    │
 │                (REST snapshot + delta merge with sequence sync)             │
 │                            │                                                │
 │                       LatencyMonitor (µs-precision)                         │
+│                       CRC32 Checksum Validation (Delta)                     │
+│                       Price-Sanity Checks (5% deviation)                    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -53,13 +56,16 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 
 ### Feed Handler
 
-- **Async WebSocket feeds**: Binance, Bybit, and Gate.io futures with auto-reconnect
+- **Async WebSocket feeds**: Binance, Bybit, Gate.io, and Delta Exchange futures with auto-reconnect
 - **L2 book reconstruction**: Full snapshot + incremental diff updates
 - **Gate.io sync**: REST snapshot + WebSocket delta merge with sequence ID tracking
+- **Delta Exchange sync**: CRC32 checksum validation, contract-to-base conversion
 - **SortedDict book**: O(log N) updates, O(1) best bid/ask, depth trimming
 - **Exchange normalizer**: Unified canonical format across venues
 - **Latency monitoring**: P50/P99/P99.9 exchange-to-local latency
 - **Market data**: mid-price, spread (BPS), VWAP, depth at price
+- **Price-sanity checks**: Rejects levels >5% from current best price
+- **Sequence validation**: Detects duplicate/corrupted sequence numbers
 
 ### Divergence Strategy
 
@@ -94,7 +100,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### Example 2: Divergence Strategy (3 exchanges)
+### Example 2: Divergence Strategy (4 exchanges)
 
 ```python
 import asyncio
@@ -110,10 +116,12 @@ orch = DivergenceOrchestrator(
     symbols=["BTCUSDT"],
     depth=20,
     n_levels=20,
-    z_threshold=3.0,           # Z-score threshold
-    min_divergence_pct=0.07,   # Minimum 0.07% divergence (covers 0.06% fee)
+    z_threshold=3.0,
+    min_divergence_pct=0.07,
     on_signal=on_signal,
     use_gateio=True,
+    use_delta=True,
+    delta_symbols=["BTCUSD"],  # Delta uses BTCUSD not BTCUSDT
 )
 
 asyncio.run(orch.start())
@@ -128,6 +136,7 @@ asyncio.run(orch.start())
 | Binance | `fstream.binance.com` | USDT-M Futures | `@trade` (individual) |
 | Bybit | `stream.bybit.com/v5/public/linear` | USDT Perpetual | `publicTrade` |
 | Gate.io | `fx-ws.gateio.ws/v4/ws/usdt` | USDT Futures | `futures.trades` |
+| Delta | `public-socket.india.delta.exchange` | USD Futures | `trades` |
 
 All exchanges use **futures** markets with **individual trade** streams for fair comparison.
 
@@ -190,16 +199,72 @@ Signals require **both** conditions:
 
 ---
 
+## Data Integrity
+
+### CRC32 Checksum Validation (Delta Exchange)
+
+Delta Exchange provides a `cs` (checksum) field in every `ob_updates` message for data integrity verification.
+
+**Calculation:**
+1. Take top 10 bid/ask levels (sorted: asks ascending, bids descending)
+2. Format: `price0:size0,price1:size1,...,price9:size9`
+3. Concatenate: `asks_string + "|" + bids_string`
+4. Calculate CRC32 (unsigned 32-bit integer)
+
+**Example:**
+```
+asks = [["100.00", "23"], ["100.05", "34"]]
+bids = [["99.04", "87"], ["98.65", "102"], ["98.30", "16"]]
+checksum_string = "100.00:23,100.05:34|99.04:87,98.65:102,98.30:16"
+CRC32 = 3599895312
+```
+
+### Price-Sanity Validation
+
+Rejects orderbook levels that deviate >5% from current best price on the same side.
+
+**Why?** A corrupted delta with a valid sequence number can pass sequence checks unchecked, overwriting book state with wrong prices. The price-sanity check catches this.
+
+**Example:**
+```
+Current best_bid: 63500.0
+Corrupted level: 48000.0 (24% deviation)
+Result: REJECTED with warning
+```
+
+### Sequence Validation
+
+Tracks `_last_seq` and rejects updates with `seq <= last_seq`.
+
+**Why?** Prevents duplicate/corrupted sequence number replays from corrupting book state.
+
+### Contract Size Conversion (Delta Exchange)
+
+Delta Exchange trades use contracts, not base asset quantity.
+
+**BTCUSD:** 1 contract = 0.001 BTC
+
+**Example:**
+```
+Trade: "s": 40.0 (40 contracts)
+Base asset: 40 * 0.001 = 0.04 BTC
+Volume: 0.04 BTC * $63,000 = $2,520
+```
+
+Without conversion, volume would be inflated 1000x (40 * $63,000 = $2,520,000).
+
+---
+
 ## Module Reference
 
 | Module | Classes | Purpose |
 |--------|---------|---------|
-| `orderbook.py` | `L2OrderBook`, `BookLevel` | L2 book with DWMP calculation |
-| `feed.py` | `BinanceFeed`, `BybitFeed`, `GateIoFeed` | WebSocket feeds with trade support |
-| `normalizer.py` | (functions) | Exchange → canonical format (Binance, Bybit, Gate.io) |
+| `orderbook.py` | `L2OrderBook`, `BookLevel` | L2 book with DWMP calculation, CRC32 checksum, price-sanity checks |
+| `feed.py` | `BinanceFeed`, `BybitFeed`, `GateIoFeed`, `DeltaFeed` | WebSocket feeds with trade support |
+| `normalizer.py` | (functions) | Exchange → canonical format (Binance, Bybit, Gate.io, Delta) |
 | `monitor.py` | `LatencyMonitor`, `FeedStats` | Latency tracking |
 | `strategy.py` | `TradeCollector`, `GlobalFairValue`, `DivergenceTracker`, `ZScoreSignal`, `Signal` | Strategy components |
-| `orchestrator.py` | `DivergenceOrchestrator` | Main strategy wiring (supports 3 exchanges) |
+| `orchestrator.py` | `DivergenceOrchestrator` | Main strategy wiring (supports 4 exchanges) |
 
 ---
 

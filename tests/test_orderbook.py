@@ -123,10 +123,10 @@ class TestLatencyMonitor:
         import time
         from cryptofeed import LatencyMonitor
         monitor = LatencyMonitor()
-        ts_ms = int(time.time() * 1000) - 10  # 10ms ago
-        ts_ns = time.monotonic_ns()
-        monitor.record("BTCUSDT", ts_ms, ts_ns)
-        monitor.record("BTCUSDT", ts_ms - 5, ts_ns)
+        local_ts_ns = time.time_ns()
+        exchange_ts_ms = (local_ts_ns // 1_000_000) - 10
+        monitor.record("BTCUSDT", exchange_ts_ms, local_ts_ns)
+        monitor.record("BTCUSDT", exchange_ts_ms - 5, local_ts_ns)
         stats = monitor.get_stats("BTCUSDT")
         assert stats is not None
         assert stats.msg_count == 2

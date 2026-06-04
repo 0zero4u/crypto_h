@@ -2,14 +2,27 @@
 L2 order book with incremental update support.
 
 Maintains a sorted price-level book from exchange diff events.
-Supports Binance (diff depth stream) and Bybit (delta) formats.
+Supports Binance (diff depth stream), Bybit (delta), Delta Exchange, and Gate.io formats.
+
+BUG FIX (2026-06-04): apply_diff/apply_snapshot now validate price sanity to prevent
+corrupted deltas from causing arbitrary DWMP spikes. A corrupted delta with a valid
+sequence number can pass through sequence checks unchecked, overwriting book state with
+wrong prices. The fix adds price-range validation before each update.
 """
 from __future__ import annotations
 
 import time
+import logging
+import zlib
 from sortedcontainers import SortedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Price sanity: reject level updates whose price deviates more than this fraction
+# from the current best price on the same side. Protects against corrupted deltas.
+MAX_PRICE_DEVIATION = 0.05   # 5% — tight enough to catch bugs, wide enough for real moves
 
 
 @dataclass
@@ -32,9 +45,7 @@ class L2OrderBook:
     def __init__(self, symbol: str, depth: int = 100):
         self.symbol = symbol
         self.depth  = depth
-        # Bids: price → qty (sorted descending)
         self._bids: SortedDict = SortedDict(lambda x: -x)
-        # Asks: price → qty (sorted ascending)
         self._asks: SortedDict = SortedDict()
 
         self.last_update_id:  int   = 0
@@ -42,54 +53,167 @@ class L2OrderBook:
         self.local_ts_ns:     int   = 0
         self._update_count:   int   = 0
 
+        # Track last-seen seq to detect duplicate/corrupted seq# replays
+        self._last_seq: int = 0
+
+        # Store raw price strings for CRC32 checksum calculation (Delta Exchange)
+        self._price_strs: Dict[float, str] = {}
+
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
     def apply_snapshot(self, bids: List[Tuple[float, float]],
                         asks: List[Tuple[float, float]],
                         update_id: int = 0,
-                        exchange_ts_ms: int = 0):
-        """Replace book with full snapshot."""
+                        exchange_ts_ms: int = 0,
+                        bids_raw: Optional[List[Tuple[str, str]]] = None,
+                        asks_raw: Optional[List[Tuple[str, str]]] = None) -> bool:
+        """
+        Replace book with full snapshot. Returns True if applied cleanly,
+        False if snapshot was rejected (price sanity check failed).
+        """
+        if update_id > 0 and update_id <= self._last_seq:
+            logger.debug(f"{self.symbol}: snapshot seq {update_id} <= last {self._last_seq}, skipping")
+            return False
+
+        if not bids and not asks:
+            logger.warning(f"{self.symbol}: empty snapshot received, rejecting")
+            return False
+
+        bid_prices = [p for p, q in bids if q > 0]
+        ask_prices = [p for p, q in asks if q > 0]
+
+        if bid_prices and ask_prices:
+            worst_bid = min(bid_prices)
+            best_ask = max(ask_prices)
+            spread = best_ask - worst_bid
+            if spread < 0:
+                logger.warning(f"{self.symbol}: snapshot has negative spread "
+                             f"(worst_bid={worst_bid}, best_ask={best_ask}), rejecting")
+                return False
+            mid = (worst_bid + best_ask) / 2
+            if mid > 0:
+                max_deviation = mid * MAX_PRICE_DEVIATION
+                for p in bid_prices:
+                    if worst_bid - p > max_deviation:
+                        logger.warning(f"{self.symbol}: snapshot bid price {p} deviates >5% from mid, rejecting")
+                        return False
+                for p in ask_prices:
+                    if p - best_ask > max_deviation:
+                        logger.warning(f"{self.symbol}: snapshot ask price {p} deviates >5% from mid, rejecting")
+                        return False
+
         self._bids.clear()
         self._asks.clear()
+        self._price_strs.clear()
+
+        raw_bid_map = {float(p): p for p, s in (bids_raw or [])}
+        raw_ask_map = {float(p): p for p, s in (asks_raw or [])}
+
         for price, qty in bids:
             if qty > 0:
                 self._bids[price] = qty
+                self._price_strs[price] = raw_bid_map.get(price, str(price))
         for price, qty in asks:
             if qty > 0:
                 self._asks[price] = qty
+                self._price_strs[price] = raw_ask_map.get(price, str(price))
         self.last_update_id = update_id
         self.exchange_ts_ms = exchange_ts_ms
         self.local_ts_ns    = time.monotonic_ns()
+        self._last_seq      = update_id
+        return True
 
     # ── Incremental updates ───────────────────────────────────────────────────
 
     def apply_diff(self, bids: List[Tuple[float, float]],
                     asks: List[Tuple[float, float]],
                     update_id: int = 0,
-                    exchange_ts_ms: int = 0):
-        """Apply incremental diff update (Binance diff_depth format)."""
+                    exchange_ts_ms: int = 0,
+                    bids_raw: Optional[List[Tuple[str, str]]] = None,
+                    asks_raw: Optional[List[Tuple[str, str]]] = None) -> bool:
+        """
+        Apply incremental diff update. Returns True if applied cleanly,
+        False if rejected (duplicate seq, price sanity failure, or empty update).
+        """
+        if update_id > 0 and update_id <= self._last_seq:
+            logger.debug(f"{self.symbol}: duplicate/old seq {update_id} <= last {self._last_seq}, skipping")
+            return False
+
+        old_best_bid = self.best_bid.price if self.best_bid else None
+        old_best_ask = self.best_ask.price if self.best_ask else None
+        old_dwmp = self.dwmp(n_levels=10)
+
+        raw_bid_map = {float(p): p for p, s in (bids_raw or [])}
+        raw_ask_map = {float(p): p for p, s in (asks_raw or [])}
+
+        valid_bids = 0
         for price, qty in bids:
             if qty == 0:
                 self._bids.pop(price, None)
+                self._price_strs.pop(price, None)
+                valid_bids += 1
             else:
+                if old_best_bid and old_best_bid > 0:
+                    deviation = abs(price - old_best_bid) / old_best_bid
+                    if deviation > MAX_PRICE_DEVIATION:
+                        logger.warning(
+                            f"{self.symbol}: SUSPICIOUS bid {price} deviates "
+                            f"{deviation*100:.2f}% from best_bid {old_best_bid}, "
+                            f"rejecting level. Raw update_id={update_id}"
+                        )
+                        continue
                 self._bids[price] = qty
+                self._price_strs[price] = raw_bid_map.get(price, str(price))
+                valid_bids += 1
 
+        valid_asks = 0
         for price, qty in asks:
             if qty == 0:
                 self._asks.pop(price, None)
+                self._price_strs.pop(price, None)
+                valid_asks += 1
             else:
+                if old_best_ask and old_best_ask > 0:
+                    deviation = abs(price - old_best_ask) / old_best_ask
+                    if deviation > MAX_PRICE_DEVIATION:
+                        logger.warning(
+                            f"{self.symbol}: SUSPICIOUS ask {price} deviates "
+                            f"{deviation*100:.2f}% from best_ask {old_best_ask}, "
+                            f"rejecting level. Raw update_id={update_id}"
+                        )
+                        continue
                 self._asks[price] = qty
+                self._price_strs[price] = raw_ask_map.get(price, str(price))
+                valid_asks += 1
+
+        if not bids and not asks:
+            logger.debug(f"{self.symbol}: empty diff, no-op")
+            return True
 
         # Trim depth
         while len(self._bids) > self.depth:
-            self._bids.popitem(-1)  # Remove worst bid
+            self._bids.popitem(-1)
         while len(self._asks) > self.depth:
-            self._asks.popitem(-1)  # Remove worst ask
+            self._asks.popitem(-1)
+
+        new_dwmp = self.dwmp(n_levels=10)
+        if old_dwmp and new_dwmp:
+            dwmp_change = abs(new_dwmp - old_dwmp) / old_dwmp * 100
+            if dwmp_change > 0.5:
+                logger.warning(
+                    f"{self.symbol}: DWMP spike {old_dwmp:.2f} -> {new_dwmp:.2f} "
+                    f"({dwmp_change:.4f}%) on seq {update_id}. "
+                    f"Valid bids={valid_bids}/{len(bids)}, asks={valid_asks}/{len(asks)}. "
+                    f"Top3 bids={list(self._bids.items())[:3]}, "
+                    f"Top3 asks={list(self._asks.items())[:3]}"
+                )
 
         self.last_update_id = update_id
         self.exchange_ts_ms = exchange_ts_ms
         self.local_ts_ns    = time.monotonic_ns()
         self._update_count  += 1
+        self._last_seq       = update_id
+        return True
 
     # ── Market data accessors ─────────────────────────────────────────────────
 
@@ -206,3 +330,13 @@ class L2OrderBook:
                 f"bid={bb.price if bb else 'N/A'}, "
                 f"ask={ba.price if ba else 'N/A'}, "
                 f"spread_bps={self.spread_bps:.2f if self.spread_bps else 'N/A'})")
+
+    def calculate_checksum(self, n_levels: int = 10) -> int:
+        asks = list(self._asks.items())[:n_levels]
+        bids = list(self._bids.items())[:n_levels]
+
+        asks_str = ",".join(f"{self._price_strs.get(p, str(p))}:{int(q)}" for p, q in asks)
+        bids_str = ",".join(f"{self._price_strs.get(p, str(p))}:{int(q)}" for p, q in bids)
+
+        checksum_string = f"{asks_str}|{bids_str}"
+        return zlib.crc32(checksum_string.encode()) & 0xFFFFFFFF

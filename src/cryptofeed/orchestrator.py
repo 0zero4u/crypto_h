@@ -1,7 +1,8 @@
 """
 Main orchestrator for cross-exchange divergence strategy.
 
-Connects BinanceFeed, BybitFeed, and (optionally) GateIoFeed to the strategy pipeline:
+Connects BinanceFeed, BybitFeed, (optionally) GateIoFeed, and (optionally) DeltaFeed
+to the strategy pipeline:
   Book updates → DWMP → GlobalFairValue → Divergence → ZScore → Signal
   Trade updates → TradeCollector → volume weighting
 """
@@ -11,7 +12,7 @@ import asyncio
 import logging
 from typing import List, Optional, Callable, Dict
 
-from .feed import BinanceFeed, BybitFeed, GateIoFeed
+from .feed import BinanceFeed, BybitFeed, GateIoFeed, DeltaFeed
 from .orderbook import L2OrderBook
 from .strategy import (
     Trade, TradeCollector, GlobalFairValue,
@@ -29,6 +30,7 @@ class DivergenceOrchestrator:
         Binance WS ──► BinanceFeed ──► on_book_update ──► _handle_book
         Bybit WS   ──► BybitFeed   ──► on_book_update ──► _handle_book
         Gate.io WS ──► GateIoFeed  ──► on_book_update ──► _handle_book (optional)
+        Delta WS   ──► DeltaFeed   ──► on_book_update ──► _handle_book (optional)
                                      ──► on_trade       ──► _handle_trade
                                         │
                                         ▼
@@ -58,12 +60,15 @@ class DivergenceOrchestrator:
         min_divergence_pct: float = 0.02,
         on_signal: Optional[Callable[[Signal], None]] = None,
         use_gateio: bool = False,
+        use_delta: bool = False,
+        delta_symbols: Optional[List[str]] = None,
     ):
         self.symbols = symbols
         self.depth = depth
         self.n_levels = n_levels
         self.on_signal = on_signal
         self.use_gateio = use_gateio
+        self.use_delta = use_delta
 
         # Strategy components
         self.trade_collector = TradeCollector(window_seconds=volume_window_seconds)
@@ -71,7 +76,7 @@ class DivergenceOrchestrator:
         self.divergence_tracker = DivergenceTracker(window_minutes=divergence_window_minutes)
         self.z_score = ZScoreSignal(threshold=z_threshold, min_divergence_pct=min_divergence_pct)
 
-        # Exchange feeds
+        # Exchange feeds - Binance/Bybit/Gate.io use same symbols (e.g. BTCUSDT)
         self.binance_feed = BinanceFeed(
             symbols=symbols,
             depth=depth,
@@ -88,6 +93,17 @@ class DivergenceOrchestrator:
         if use_gateio:
             self.gateio_feed = GateIoFeed(
                 symbols=symbols,
+                depth=depth,
+                on_book_update=self._handle_book,
+                on_trade=self._handle_trade,
+            )
+
+        # Delta uses different symbols (e.g. BTCUSD instead of BTCUSDT)
+        self.delta_feed: Optional[DeltaFeed] = None
+        if use_delta:
+            delta_syms = delta_symbols or symbols
+            self.delta_feed = DeltaFeed(
+                symbols=delta_syms,
                 depth=depth,
                 on_book_update=self._handle_book,
                 on_trade=self._handle_trade,
@@ -174,6 +190,10 @@ class DivergenceOrchestrator:
             for sym, b in self.gateio_feed.books.items():
                 if b is book:
                     return "gateio"
+        if self.delta_feed:
+            for sym, b in self.delta_feed.books.items():
+                if b is book:
+                    return "delta"
         return None
 
     async def start(self):
@@ -183,11 +203,14 @@ class DivergenceOrchestrator:
         await self.bybit_feed.start()
         if self.gateio_feed:
             await self.gateio_feed.start()
+        if self.delta_feed:
+            await self.delta_feed.start()
 
     async def stop(self):
         """Stop all exchange feeds."""
         logger.info("Stopping divergence orchestrator")
-        for feed in [self.binance_feed, self.bybit_feed, self.gateio_feed]:
+        for feed in [self.binance_feed, self.bybit_feed,
+                     self.gateio_feed, self.delta_feed]:
             if feed:
                 try:
                     await asyncio.wait_for(feed.stop(), timeout=2)

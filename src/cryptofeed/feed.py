@@ -16,6 +16,8 @@ from .normalizer import (
     normalize_bybit_depth,
     normalize_binance_trade,
     normalize_bybit_trade,
+    normalize_delta_ob,
+    normalize_delta_trade,
 )
 from .monitor import LatencyMonitor
 
@@ -512,3 +514,188 @@ class GateIoFeed(ExchangeFeed):
                         logger.info(f"Gate.io {symbol} resynced, new id={snapshot_id}")
             except Exception as e:
                 logger.error(f"Gate.io resync error for {symbol}: {e}")
+
+
+class DeltaFeed(ExchangeFeed):
+    """
+    Delta Exchange WebSocket market data feed.
+
+    Uses ob_updates channel for orderbook (snapshot + incremental deltas)
+    and trades channel for trade data.
+
+    Unlike Gate.io, Delta sends the initial snapshot over WebSocket,
+    so no REST fetch is needed. Sequence tracking via 'seq' field.
+
+    Endpoint: wss://public-socket.india.delta.exchange
+    """
+
+    BASE_WS = "wss://public-socket.india.delta.exchange"
+
+    def __init__(self, symbols: List[str], depth: int = 20,
+                 on_book_update: Optional[Callable] = None,
+                 on_trade: Optional[Callable] = None):
+        super().__init__(symbols, depth, on_book_update, on_trade)
+        self._last_seq: Dict[str, int] = {}
+        self._synced: Dict[str, bool] = {s: False for s in symbols}
+
+    @property
+    def ws_url(self) -> str:
+        return self.BASE_WS
+
+    def build_subscribe_message(self) -> dict:
+        return {
+            "type": "subscribe",
+            "payload": {
+                "channels": [
+                    {"name": "ob_updates", "symbols": self.symbols},
+                    {"name": "trades", "symbols": self.symbols},
+                ]
+            }
+        }
+
+    def process_message(self, msg: dict):
+        msg_type = msg.get("type")
+
+        if msg_type == "trades":
+            trade_norm = normalize_delta_trade(msg)
+            if trade_norm and self.on_trade:
+                self.on_trade(trade_norm)
+            return
+
+        if msg_type == "ob_updates":
+            self._handle_ob_update(msg)
+            return
+
+    def _handle_ob_update(self, msg: dict):
+        norm = normalize_delta_ob(msg)
+        if not norm:
+            return
+
+        symbol = norm["symbol"]
+        book = self.books.get(symbol)
+        if not book:
+            return
+
+        action = msg.get("action")
+
+        if action == "snapshot":
+            ok = book.apply_snapshot(norm["bids"], norm["asks"],
+                                    norm["update_id"], norm["ts_ms"],
+                                    bids_raw=norm.get("bids_raw"),
+                                    asks_raw=norm.get("asks_raw"))
+            if ok:
+                expected_cs = norm.get("cs", 0)
+                if expected_cs != 0:
+                    actual_cs = book.calculate_checksum(n_levels=10)
+                    if actual_cs != expected_cs:
+                        logger.warning(f"Delta {symbol}: snapshot checksum mismatch, "
+                                     f"seq={norm['update_id']}, expected_cs={expected_cs}, "
+                                     f"actual_cs={actual_cs}. Resubscribing...")
+                        self._synced[symbol] = False
+                        asyncio.create_task(self._resubscribe(symbol))
+                        return
+                self._last_seq[symbol] = norm["update_id"]
+                self._synced[symbol] = True
+                logger.info(f"Delta {symbol} snapshot loaded, seq={norm['update_id']}, "
+                           f"top_bid={book.best_bid.price if book.best_bid else 'N/A'}, "
+                           f"top_ask={book.best_ask.price if book.best_ask else 'N/A'}")
+            else:
+                logger.warning(f"Delta {symbol}: snapshot REJECTED by price sanity check, "
+                             f"seq={norm['update_id']}. Resubscribing...")
+                self._synced[symbol] = False
+                asyncio.create_task(self._resubscribe(symbol))
+            return
+
+        if not self._synced.get(symbol, False):
+            return
+
+        expected_seq = self._last_seq.get(symbol, 0) + 1
+        actual_seq = norm["update_id"]
+
+        if actual_seq != expected_seq:
+            logger.warning(f"Delta {symbol}: sequence gap, "
+                         f"expected {expected_seq}, got {actual_seq}. Resubscribing...")
+            self._synced[symbol] = False
+            self._last_seq.pop(symbol, None)
+            asyncio.create_task(self._resubscribe(symbol))
+            return
+
+        old_dwmp = book.dwmp(n_levels=20)
+        old_best_bid = book.best_bid.price if book.best_bid else None
+        old_best_ask = book.best_ask.price if book.best_ask else None
+
+        ok = book.apply_diff(norm["bids"], norm["asks"],
+                            norm["update_id"], norm["ts_ms"],
+                            bids_raw=norm.get("bids_raw"),
+                            asks_raw=norm.get("asks_raw"))
+
+        if not ok:
+            logger.warning(f"Delta {symbol}: diff REJECTED (price sanity or duplicate seq), "
+                         f"seq={actual_seq}. Waiting for resync...")
+            self._synced[symbol] = False
+            asyncio.create_task(self._resubscribe(symbol))
+            return
+
+        expected_cs = norm.get("cs", 0)
+        if expected_cs != 0:
+            actual_cs = book.calculate_checksum(n_levels=10)
+            if actual_cs != expected_cs:
+                logger.warning(f"Delta {symbol}: checksum mismatch, seq={actual_seq}, "
+                             f"expected_cs={expected_cs}, actual_cs={actual_cs}. Resubscribing...")
+                self._synced[symbol] = False
+                asyncio.create_task(self._resubscribe(symbol))
+                return
+
+        self._last_seq[symbol] = actual_seq
+
+        new_dwmp = book.dwmp(n_levels=20)
+        new_best_bid = book.best_bid.price if book.best_bid else None
+        new_best_ask = book.best_ask.price if book.best_ask else None
+
+        if old_dwmp and new_dwmp:
+            change_pct = abs(new_dwmp - old_dwmp) / old_dwmp * 100
+            if change_pct > 0.1:
+                logger.warning(
+                    f"Delta {symbol}: *** SPIKE *** {old_dwmp:.2f} -> {new_dwmp:.2f} "
+                    f"({change_pct:.4f}%) seq={actual_seq} ts_ms={norm['ts_ms']}"
+                )
+                logger.warning(f"  Bid: {old_best_bid} -> {new_best_bid}")
+                logger.warning(f"  Ask: {old_best_ask} -> {new_best_ask}")
+                logger.warning(f"  Update bids: {norm['bids'][:5]}")
+                logger.warning(f"  Update asks: {norm['asks'][:5]}")
+                logger.warning(f"  Book bids top3: {list(book._bids.items())[:3]}")
+                logger.warning(f"  Book asks top3: {list(book._asks.items())[:3]}")
+                logger.warning(f"  Raw msg: {msg}")
+
+        ts_ns = time.monotonic_ns()
+        self.monitor.record(symbol, norm["ts_ms"], ts_ns)
+        if self.on_book_update:
+            self.on_book_update(book)
+
+    async def _resubscribe(self, symbol: str):
+        if not self._ws:
+            return
+
+        try:
+            unsub_msg = {
+                "type": "unsubscribe",
+                "payload": {
+                    "channels": [
+                        {"name": "ob_updates", "symbols": [symbol]},
+                    ]
+                }
+            }
+            await self._ws.send(orjson.dumps(unsub_msg).decode())
+
+            sub_msg = {
+                "type": "subscribe",
+                "payload": {
+                    "channels": [
+                        {"name": "ob_updates", "symbols": [symbol]},
+                    ]
+                }
+            }
+            await self._ws.send(orjson.dumps(sub_msg).decode())
+            logger.info(f"Delta {symbol}: resubscribed for fresh snapshot")
+        except Exception as e:
+            logger.error(f"Delta {symbol} resubscribe error: {e}")

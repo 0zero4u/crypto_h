@@ -275,3 +275,114 @@ def normalize_gateio_trade(msg: dict) -> Optional[dict]:
         "side":     "buy" if size > 0 else "sell",
         "volume":   abs(size),
     }
+
+
+def normalize_delta_ob(msg: dict) -> Optional[dict]:
+    """
+    Parse Delta Exchange ob_updates WebSocket message.
+
+    Delta format (snapshot):
+    {
+      "action": "snapshot",
+      "a": [["16919.0", "1087"], ["16919.5", "1193"]],
+      "b": [["16918.0", "602"], ["16917.5", "1792"]],
+      "ts": 1671140718980723,   // microseconds
+      "seq": 6199,
+      "sy": "BTCUSD",
+      "type": "ob_updates",
+      "cs": 2178756498          // checksum (CRC32)
+    }
+
+    Delta format (update):
+    {
+      "action": "update",
+      "a": [["16919.0", "0"], ["16919.5", "710"]],   // size 0 = delete
+      "b": [["16918.5", "304"]],
+      "seq": 6200,
+      "sy": "BTCUSD",
+      "type": "ob_updates",
+      "ts": 1671140769059031,
+      "cs": 3409694612
+    }
+    """
+    msg_type = msg.get("type")
+    if msg_type != "ob_updates":
+        return None
+
+    action = msg.get("action")
+    if action not in ("snapshot", "update"):
+        return None
+
+    def parse_levels(raw: list) -> List[Tuple[float, float]]:
+        return [(float(p), float(s)) for p, s in raw]
+
+    # Convert microseconds to milliseconds
+    ts_us = msg.get("ts", 0)
+    ts_ms = ts_us // 1000 if ts_us > 0 else 0
+
+    raw_bids = msg.get("b", [])
+    raw_asks = msg.get("a", [])
+
+    return {
+        "type":      "snapshot" if action == "snapshot" else "diff",
+        "symbol":    msg.get("sy", "UNKNOWN"),
+        "exchange":  "delta",
+        "ts_ms":     ts_ms,
+        "update_id": msg.get("seq", 0),
+        "bids":      parse_levels(raw_bids),
+        "asks":      parse_levels(raw_asks),
+        "bids_raw":  raw_bids,
+        "asks_raw":  raw_asks,
+        "cs":        msg.get("cs", 0),
+    }
+
+
+def normalize_delta_trade(msg: dict) -> Optional[dict]:
+    """
+    Parse Delta Exchange trades WebSocket message.
+
+    Delta format:
+    {
+      "type": "trades",
+      "sy": "BTCUSD",
+      "p": "63678.0",
+      "s": 40.0,
+      "r": "m",                    // "m"=maker, "t"=taker
+      "t": 1780557431637499,       // trade timestamp (microseconds)
+      "ts": 1780557432004295       // server timestamp (microseconds)
+    }
+    """
+    msg_type = msg.get("type")
+    if msg_type != "trades":
+        return None
+
+    price = msg.get("p")
+    size = msg.get("s")
+    if price is None or size is None:
+        return None
+
+    size = abs(float(size))
+    if size == 0:
+        return None
+
+    # "r" field: "t" = taker was buyer, "m" = taker was seller
+    role = msg.get("r", "")
+    side = "buy" if role == "t" else "sell"
+
+    # Convert microseconds to milliseconds (use trade timestamp "t")
+    ts_us = msg.get("t", 0)
+    ts_ms = ts_us // 1000 if ts_us > 0 else 0
+
+    # Delta BTCUSD: 1 contract = 0.001 BTC
+    # Convert contracts to base asset quantity
+    CONTRACT_SIZE = 0.001
+    base_qty = size * CONTRACT_SIZE
+
+    return {
+        "symbol":   msg.get("sy", "UNKNOWN"),
+        "exchange": "delta",
+        "price":    float(price),
+        "qty":      base_qty,
+        "ts_ms":    ts_ms,
+        "side":     side,
+    }
