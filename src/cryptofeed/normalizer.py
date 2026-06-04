@@ -261,6 +261,9 @@ def normalize_gateio_trade(msg: dict) -> Optional[dict]:
     trade = results[0] if isinstance(results, list) else results
 
     size = float(trade.get("size", 0))
+    if size == 0:
+        return None
+
     symbol = trade.get("contract", "UNKNOWN")
 
     return {
@@ -270,5 +273,5 @@ def normalize_gateio_trade(msg: dict) -> Optional[dict]:
         "qty":      abs(size),
         "ts_ms":    trade.get("create_time_ms", 0),
         "side":     "buy" if size > 0 else "sell",
-        "volume":   abs(size),  # Gate.io: qty is already in USD contracts
+        "volume":   abs(size),
     }

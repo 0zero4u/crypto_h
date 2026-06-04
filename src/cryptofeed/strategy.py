@@ -38,6 +38,7 @@ class Signal:
     gfv: float
     dwmp: float
     ts_ms: int
+    net_divergence_pct: float = 0.0  # after fees
 
 
 class TradeCollector:
@@ -188,23 +189,29 @@ class ZScoreSignal:
     is from the rolling baseline, automatically handling permanent exchange offsets.
     """
 
-    def __init__(self, threshold: float = 3.0):
+    ROUND_TRIP_FEE = 0.0006  # 0.06% round-trip
+
+    def __init__(self, threshold: float = 3.0, min_divergence_pct: float = 0.07):
         self.threshold = threshold
+        self.min_divergence_pct = min_divergence_pct
 
     def evaluate(self, exchange: str, dwmp: float, gfv: float,
                  divergence_pct: float, mean: float, std: float,
                  ts_ms: int) -> Optional[Signal]:
         """
         Evaluate if current divergence warrants a signal.
-
-        Returns Signal if |Z| > threshold, None otherwise.
+        Requires both Z > threshold AND |divergence| > min_divergence_pct.
         """
         if std < 1e-10:
+            return None
+
+        if abs(divergence_pct) < self.min_divergence_pct:
             return None
 
         z_score = (divergence_pct - mean) / std
 
         if divergence_pct > 0 and z_score > self.threshold:
+            net = divergence_pct - self.ROUND_TRIP_FEE
             return Signal(
                 exchange=exchange,
                 direction="short",
@@ -213,9 +220,11 @@ class ZScoreSignal:
                 gfv=gfv,
                 dwmp=dwmp,
                 ts_ms=ts_ms,
+                net_divergence_pct=net,
             )
 
         if divergence_pct < 0 and z_score < -self.threshold:
+            net = abs(divergence_pct) - self.ROUND_TRIP_FEE
             return Signal(
                 exchange=exchange,
                 direction="long",
@@ -224,6 +233,7 @@ class ZScoreSignal:
                 gfv=gfv,
                 dwmp=dwmp,
                 ts_ms=ts_ms,
+                net_divergence_pct=net,
             )
 
         return None

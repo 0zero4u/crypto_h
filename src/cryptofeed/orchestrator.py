@@ -50,13 +50,14 @@ class DivergenceOrchestrator:
     def __init__(
         self,
         symbols: List[str],
-        depth: int = 20,  # Binance max is 20
+        depth: int = 20,
         n_levels: int = 20,
         volume_window_seconds: int = 60,
         divergence_window_minutes: int = 3,
         z_threshold: float = 3.0,
+        min_divergence_pct: float = 0.07,
         on_signal: Optional[Callable[[Signal], None]] = None,
-        use_gateio: bool = False,  # Optional third exchange
+        use_gateio: bool = False,
     ):
         self.symbols = symbols
         self.depth = depth
@@ -68,7 +69,7 @@ class DivergenceOrchestrator:
         self.trade_collector = TradeCollector(window_seconds=volume_window_seconds)
         self.gfv = GlobalFairValue(self.trade_collector)
         self.divergence_tracker = DivergenceTracker(window_minutes=divergence_window_minutes)
-        self.z_score = ZScoreSignal(threshold=z_threshold)
+        self.z_score = ZScoreSignal(threshold=z_threshold, min_divergence_pct=min_divergence_pct)
 
         # Exchange feeds
         self.binance_feed = BinanceFeed(

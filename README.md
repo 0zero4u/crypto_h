@@ -7,7 +7,7 @@ Binance · Bybit · Gate.io · DWMP · Z-Score signals
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Production-grade async WebSocket feed handler for crypto market microstructure research. Supports real-time L2 order book reconstruction with incremental diff updates, latency monitoring, and normalized multi-exchange data. Includes a cross-exchange divergence strategy using DWMP fair value and z-score signal generation.
+Production-grade async WebSocket feed handler for crypto market microstructure research. Supports real-time L2 order book reconstruction with incremental diff updates, latency monitoring, and normalized multi-exchange data. Includes a cross-exchange divergence strategy using DWMP fair value and z-score signal generation with fee-adjusted filtering.
 
 ---
 
@@ -37,11 +37,13 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 │                              ▲                           │                  │
 │                              │                           ▼                  │
 │   ┌──────────────────────────┴──────────┐    ┌─────────────────────┐       │
-│   │ TradeCollector (1-min rolling vol)  │◄───│ ZScoreSignal (|Z|>3)│       │
-│   └─────────────────────────────────────┘    └──────────┬──────────┘       │
+│   │ TradeCollector (1-min rolling vol)  │◄───│ ZScoreSignal        │       │
+│   └─────────────────────────────────────┘    │ |Z|>3 AND |D|>0.07%│       │
+│                                              └──────────┬──────────┘       │
 │                                                         │                  │
 │                                                         ▼                  │
-│                                                   on_signal(Signal)        │
+│                                              on_signal(Signal)             │
+│                                              net_divergence_pct            │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -65,7 +67,8 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 - **Global Fair Value**: Volume-weighted DWMP across exchanges (1-min rolling)
 - **Divergence Tracking**: Per-exchange rolling baseline (3-min mean/std)
 - **Z-Score Signals**: Automatically absorbs permanent exchange differences
-- **Signal Types**: Long (exchange cheap) / Short (exchange rich) when |Z| > 3
+- **Fee-Adjusted Filtering**: Only signals where |D| > 0.07% AND |Z| > 3
+- **Net Profitability**: Each signal includes `net_divergence_pct` after 0.06% round-trip fee
 
 ---
 
@@ -101,16 +104,16 @@ def on_signal(signal: Signal):
     print(f"SIGNAL: {signal.direction.upper()} {signal.exchange}")
     print(f"  Z-Score: {signal.z_score:.2f}")
     print(f"  Divergence: {signal.divergence_pct:.4f}%")
-    print(f"  DWMP: {signal.dwmp:.2f}")
-    print(f"  GFV: {signal.gfv:.2f}")
+    print(f"  Net (after fees): {signal.net_divergence_pct:.4f}%")
 
 orch = DivergenceOrchestrator(
     symbols=["BTCUSDT"],
-    depth=20,           # Max depth for Binance/Gate.io
-    n_levels=20,        # DWMP depth
-    z_threshold=3.0,    # Z-score trigger threshold
+    depth=20,
+    n_levels=20,
+    z_threshold=3.0,           # Z-score threshold
+    min_divergence_pct=0.07,   # Minimum 0.07% divergence (covers 0.06% fee)
     on_signal=on_signal,
-    use_gateio=True,    # Enable Gate.io as 3rd exchange
+    use_gateio=True,
 )
 
 asyncio.run(orch.start())
@@ -162,18 +165,28 @@ Z = (D - µ) / σ
 
 Where µ, σ are rolling 3-minute mean/std of divergence for that exchange.
 
-### Why This Works
+### Signal Conditions (Fee-Adjusted)
 
-- Permanent exchange differences (e.g., Bybit +0.03%) are absorbed into the baseline
-- Only **abnormal** deviations trigger signals
-- Volume weighting ensures the most liquid exchange has more influence
+Signals require **both** conditions:
 
-### Signal Conditions
-
-| Condition | Meaning |
+| Condition | Purpose |
 |-----------|---------|
-| D > 0 AND Z > 3 | Exchange rich vs market → SHORT |
-| D < 0 AND Z < -3 | Exchange cheap vs market → LONG |
+| \|Z\| > 3 | Statistical significance (99.7% confidence) |
+| \|D\| > 0.07% | Covers 0.06% round-trip fee + buffer |
+
+### Why Both Filters?
+
+- **Z-threshold alone fails**: In low-volatility (σ=0.008%), Z=3 means only 0.028% divergence — doesn't cover fees
+- **Min divergence alone fails**: 0.10% divergence might be normal (Z=1) in high-volatility — likely to mean-revert
+- **Both together**: Z ensures the move is unusual, min divergence ensures profitability
+
+### Signal Fields
+
+| Field | Description |
+|-------|-------------|
+| `divergence_pct` | Raw divergence from GFV |
+| `z_score` | Standard deviations from baseline |
+| `net_divergence_pct` | Divergence after 0.06% round-trip fee |
 
 ---
 

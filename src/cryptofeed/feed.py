@@ -171,6 +171,7 @@ class BinanceFeed(ExchangeFeed):
                     await asyncio.sleep(2)
 
     async def _process_stream(self, ws, is_trade: bool):
+        import websockets
         try:
             async for raw in ws:
                 if not self._running:
