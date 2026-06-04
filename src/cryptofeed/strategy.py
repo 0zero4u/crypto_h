@@ -25,6 +25,7 @@ class Trade:
     qty: float
     ts_ms: int
     side: str  # "buy" or "sell"
+    volume: float = 0.0  # USD volume (auto-computed if 0)
 
 
 @dataclass
@@ -62,19 +63,22 @@ class TradeCollector:
         while trades and trades[0].ts_ms < cutoff_ms:
             trades.popleft()
 
+    def _trade_volume(self, t: Trade) -> float:
+        return t.volume if t.volume > 0 else t.price * t.qty
+
     def get_volume(self, exchange: str) -> float:
         """Get total executed quote volume in the window for an exchange."""
         if exchange not in self._trades:
             return 0.0
         self._prune(exchange)
-        return sum(t.price * t.qty for t in self._trades[exchange])
+        return sum(self._trade_volume(t) for t in self._trades[exchange])
 
     def get_volumes(self) -> Dict[str, float]:
         """Get quote volumes for all exchanges."""
         for exchange in list(self._trades.keys()):
             self._prune(exchange)
         return {
-            ex: sum(t.price * t.qty for t in trades)
+            ex: sum(self._trade_volume(t) for t in trades)
             for ex, trades in self._trades.items()
         }
 
@@ -128,11 +132,11 @@ class DivergenceTracker:
 
     D_j = (DWMP_j - GFV) / GFV * 100  (in percent)
 
-    Maintains rolling 5-minute baseline (mean, std) per exchange.
+    Maintains rolling 3-minute baseline (mean, std) per exchange.
     This absorbs permanent exchange differences (e.g., Bybit naturally +0.03%).
     """
 
-    def __init__(self, window_minutes: int = 5):
+    def __init__(self, window_minutes: int = 3):
         self.window_minutes = window_minutes
         self._divergences: Dict[str, Deque[Tuple[float, int]]] = {}
 

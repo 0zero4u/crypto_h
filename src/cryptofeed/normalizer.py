@@ -138,27 +138,137 @@ def normalize_bybit_depth(msg: dict) -> Optional[dict]:
 
 def normalize_binance_trade(msg: dict) -> Optional[dict]:
     """
-    Parse Binance trade stream message.
-
-    Binance format:
-    {
-      "e": "trade",
-      "E": 1672531200000,
-      "s": "BTCUSDT",
-      "p": "43200.00",
-      "q": "0.100",
-      "T": 1672531200000,
-      "m": true
-    }
+    Parse Binance trade/aggTrade stream message.
+    Handles combined-stream wrapper: {"stream": "...", "data": {...}}
     """
-    if msg.get("e") != "trade":
+    data = msg.get("data", msg)
+    event_type = data.get("e")
+    if event_type not in ("trade", "aggTrade"):
         return None
 
     return {
-        "symbol": msg["s"],
+        "symbol": data["s"],
         "exchange": "binance",
-        "price": float(msg["p"]),
-        "qty": float(msg["q"]),
-        "ts_ms": msg["T"],
-        "side": "sell" if msg.get("m") else "buy",
+        "price": float(data["p"]),
+        "qty": float(data["q"]),
+        "ts_ms": data["T"],
+        "side": "sell" if data.get("m") else "buy",
+    }
+
+
+def normalize_gateio_depth(msg: dict) -> Optional[dict]:
+    """
+    Parse Gate.io futures order_book_update delta message.
+
+    Gate.io format:
+    {
+      "channel": "futures.order_book_update",
+      "event": "update",
+      "result": {
+        "t": 1615366381417,
+        "s": "BTC_USDT",
+        "U": 2517661101,
+        "u": 2517661113,
+        "b": [{"p": "54672.1", "s": "0"}, ...],
+        "a": [{"p": "54743.6", "s": "95"}, ...]
+      }
+    }
+    """
+    channel = msg.get("channel", "")
+    if channel != "futures.order_book_update":
+        return None
+
+    event = msg.get("event")
+    if event != "update":
+        return None
+
+    result = msg.get("result", {})
+
+    def parse_levels(raw: list) -> List[Tuple[float, float]]:
+        return [(float(item["p"]), float(item["s"])) for item in raw]
+
+    symbol = result.get("s", "UNKNOWN")
+    normalized_symbol = symbol.replace("_", "")
+
+    return {
+        "type":      "diff",
+        "symbol":    normalized_symbol,
+        "exchange":  "gateio",
+        "ts_ms":     result.get("t", 0),
+        "update_id": result.get("u", 0),
+        "first_id":  result.get("U", 0),
+        "bids":      parse_levels(result.get("b", [])),
+        "asks":      parse_levels(result.get("a", [])),
+    }
+
+
+def normalize_gateio_snapshot(data: dict, symbol: str) -> Optional[dict]:
+    """
+    Parse Gate.io REST order book snapshot.
+
+    GET /api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=20&with_id=true
+
+    Response:
+    {
+      "id": 81045888518,
+      "asks": [{"p": "94364.1", "s": "41549"}, ...],
+      "bids": [{"p": "94364", "s": "10000"}, ...]
+    }
+    """
+    def parse_levels(raw: list) -> List[Tuple[float, float]]:
+        return [(float(item["p"]), float(item["s"])) for item in raw]
+
+    normalized_symbol = symbol.replace("_", "")
+
+    return {
+        "type":      "snapshot",
+        "symbol":    normalized_symbol,
+        "exchange":  "gateio",
+        "ts_ms":     data.get("current", 0),
+        "update_id": data.get("id", 0),
+        "bids":      parse_levels(data.get("bids", [])),
+        "asks":      parse_levels(data.get("asks", [])),
+    }
+
+
+def normalize_gateio_trade(msg: dict) -> Optional[dict]:
+    """
+    Parse Gate.io futures.trades message.
+
+    {
+      "channel": "futures.trades",
+      "event": "update",
+      "result": [{
+        "size": "-108",
+        "create_time_ms": 1545136464123,
+        "price": "96.4",
+        "contract": "BTC_USDT"
+      }]
+    }
+    """
+    channel = msg.get("channel", "")
+    if channel != "futures.trades":
+        return None
+
+    event = msg.get("event")
+    if event != "update":
+        return None
+
+    results = msg.get("result", [])
+    if not results:
+        return None
+
+    trade = results[0] if isinstance(results, list) else results
+
+    size = float(trade.get("size", 0))
+    symbol = trade.get("contract", "UNKNOWN")
+
+    return {
+        "symbol":   symbol.replace("_", ""),
+        "exchange": "gateio",
+        "price":    float(trade["price"]),
+        "qty":      abs(size),
+        "ts_ms":    trade.get("create_time_ms", 0),
+        "side":     "buy" if size > 0 else "sell",
+        "volume":   abs(size),  # Gate.io: qty is already in USD contracts
     }

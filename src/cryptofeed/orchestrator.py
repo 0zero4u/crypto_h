@@ -1,7 +1,7 @@
 """
 Main orchestrator for cross-exchange divergence strategy.
 
-Connects BinanceFeed and BybitFeed to the strategy pipeline:
+Connects BinanceFeed, BybitFeed, and (optionally) GateIoFeed to the strategy pipeline:
   Book updates → DWMP → GlobalFairValue → Divergence → ZScore → Signal
   Trade updates → TradeCollector → volume weighting
 """
@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import List, Optional, Callable, Dict
 
-from .feed import BinanceFeed, BybitFeed
+from .feed import BinanceFeed, BybitFeed, GateIoFeed
 from .orderbook import L2OrderBook
 from .strategy import (
     Trade, TradeCollector, GlobalFairValue,
@@ -28,6 +28,7 @@ class DivergenceOrchestrator:
     Architecture:
         Binance WS ──► BinanceFeed ──► on_book_update ──► _handle_book
         Bybit WS   ──► BybitFeed   ──► on_book_update ──► _handle_book
+        Gate.io WS ──► GateIoFeed  ──► on_book_update ──► _handle_book (optional)
                                      ──► on_trade       ──► _handle_trade
                                         │
                                         ▼
@@ -52,14 +53,16 @@ class DivergenceOrchestrator:
         depth: int = 20,  # Binance max is 20
         n_levels: int = 20,
         volume_window_seconds: int = 60,
-        divergence_window_minutes: int = 5,
+        divergence_window_minutes: int = 3,
         z_threshold: float = 3.0,
         on_signal: Optional[Callable[[Signal], None]] = None,
+        use_gateio: bool = False,  # Optional third exchange
     ):
         self.symbols = symbols
         self.depth = depth
         self.n_levels = n_levels
         self.on_signal = on_signal
+        self.use_gateio = use_gateio
 
         # Strategy components
         self.trade_collector = TradeCollector(window_seconds=volume_window_seconds)
@@ -80,6 +83,14 @@ class DivergenceOrchestrator:
             on_book_update=self._handle_book,
             on_trade=self._handle_trade,
         )
+        self.gateio_feed: Optional[GateIoFeed] = None
+        if use_gateio:
+            self.gateio_feed = GateIoFeed(
+                symbols=symbols,
+                depth=depth,
+                on_book_update=self._handle_book,
+                on_trade=self._handle_trade,
+            )
 
         # Latest DWMPs per exchange
         self._dwmps: Dict[str, float] = {}
@@ -93,6 +104,7 @@ class DivergenceOrchestrator:
             qty=trade_data["qty"],
             ts_ms=trade_data["ts_ms"],
             side=trade_data["side"],
+            volume=trade_data.get("volume", 0.0),
         )
         self.trade_collector.add_trade(trade)
 
@@ -157,19 +169,29 @@ class DivergenceOrchestrator:
         for sym, b in self.bybit_feed.books.items():
             if b is book:
                 return "bybit"
+        if self.gateio_feed:
+            for sym, b in self.gateio_feed.books.items():
+                if b is book:
+                    return "gateio"
         return None
 
     async def start(self):
-        """Start both exchange feeds."""
+        """Start all exchange feeds."""
         logger.info(f"Starting divergence orchestrator for {self.symbols}")
         await self.binance_feed.start()
         await self.bybit_feed.start()
+        if self.gateio_feed:
+            await self.gateio_feed.start()
 
     async def stop(self):
-        """Stop both exchange feeds."""
+        """Stop all exchange feeds."""
         logger.info("Stopping divergence orchestrator")
-        await self.binance_feed.stop()
-        await self.bybit_feed.stop()
+        for feed in [self.binance_feed, self.bybit_feed, self.gateio_feed]:
+            if feed:
+                try:
+                    await asyncio.wait_for(feed.stop(), timeout=2)
+                except asyncio.TimeoutError:
+                    pass
 
     def get_state(self) -> dict:
         """Get current strategy state for monitoring."""

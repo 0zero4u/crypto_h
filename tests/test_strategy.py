@@ -1,10 +1,13 @@
-"""Tests for strategy modules."""
+"""Tests for strategy modules and Gate.io integration."""
 import pytest
 import time
 from cryptofeed.orderbook import L2OrderBook
 from cryptofeed.strategy import (
     Trade, TradeCollector, GlobalFairValue,
     DivergenceTracker, ZScoreSignal, Signal,
+)
+from cryptofeed.normalizer import (
+    normalize_gateio_depth, normalize_gateio_snapshot, normalize_gateio_trade,
 )
 
 
@@ -237,3 +240,86 @@ class TestZScoreSignal:
         signal = zs.evaluate("binance", 43200.0, 43200.0,
                              0.05, mean=0.05, std=0.0, ts_ms=0)
         assert signal is None  # Avoid division by zero
+
+
+class TestGateIoNormalizers:
+    """Tests for Gate.io normalizer functions."""
+
+    def test_gateio_depth_delta(self):
+        msg = {
+            "channel": "futures.order_book_update",
+            "event": "update",
+            "result": {
+                "t": 1615366381417,
+                "s": "BTC_USDT",
+                "U": 2517661101,
+                "u": 2517661113,
+                "b": [{"p": "54672.1", "s": "0"}, {"p": "54664.5", "s": "58794"}],
+                "a": [{"p": "54743.6", "s": "0"}, {"p": "54742", "s": "95"}],
+            },
+        }
+        norm = normalize_gateio_depth(msg)
+        assert norm is not None
+        assert norm["symbol"] == "BTCUSDT"
+        assert norm["exchange"] == "gateio"
+        assert norm["type"] == "diff"
+        assert norm["first_id"] == 2517661101
+        assert norm["update_id"] == 2517661113
+        assert len(norm["bids"]) == 2
+        assert len(norm["asks"]) == 2
+        # Check size=0 is preserved (for removal logic)
+        assert norm["bids"][0] == (54672.1, 0.0)
+        assert norm["bids"][1] == (54664.5, 58794.0)
+
+    def test_gateio_depth_wrong_channel(self):
+        msg = {"channel": "futures.trades", "event": "update", "result": {}}
+        assert normalize_gateio_depth(msg) is None
+
+    def test_gateio_snapshot(self):
+        data = {
+            "id": 81045888518,
+            "current": 1745721460831,
+            "asks": [{"p": "94364.1", "s": "41549"}, {"p": "94365", "s": "100"}],
+            "bids": [{"p": "94364", "s": "10000"}, {"p": "94363", "s": "500"}],
+        }
+        norm = normalize_gateio_snapshot(data, "BTC_USDT")
+        assert norm is not None
+        assert norm["symbol"] == "BTCUSDT"
+        assert norm["exchange"] == "gateio"
+        assert norm["type"] == "snapshot"
+        assert norm["update_id"] == 81045888518
+        assert len(norm["asks"]) == 2
+        assert len(norm["bids"]) == 2
+        assert norm["asks"][0] == (94364.1, 41549.0)
+
+    def test_gateio_trade(self):
+        msg = {
+            "channel": "futures.trades",
+            "event": "update",
+            "result": [{"size": "-108", "create_time_ms": 1545136464123,
+                       "price": "96.4", "contract": "BTC_USDT"}],
+        }
+        norm = normalize_gateio_trade(msg)
+        assert norm is not None
+        assert norm["symbol"] == "BTCUSDT"
+        assert norm["exchange"] == "gateio"
+        assert norm["price"] == 96.4
+        assert norm["qty"] == 108.0  # abs of -108
+        assert norm["side"] == "sell"  # negative = sell
+        assert norm["ts_ms"] == 1545136464123
+
+    def test_gateio_trade_buy(self):
+        msg = {
+            "channel": "futures.trades",
+            "event": "update",
+            "result": [{"size": "50", "create_time_ms": 1545136464123,
+                       "price": "100.5", "contract": "ETH_USDT"}],
+        }
+        norm = normalize_gateio_trade(msg)
+        assert norm is not None
+        assert norm["symbol"] == "ETHUSDT"
+        assert norm["side"] == "buy"  # positive = buy
+
+    def test_gateio_trade_wrong_channel(self):
+        msg = {"channel": "futures.order_book_update", "event": "update", "result": []}
+        assert normalize_gateio_trade(msg) is None
