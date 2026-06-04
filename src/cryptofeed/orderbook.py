@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 # from the current best price on the same side. Protects against corrupted deltas.
 MAX_PRICE_DEVIATION = 0.05   # 5% — tight enough to catch bugs, wide enough for real moves
 
+# Delta Exchange tick sizes by symbol
+DELTA_TICK_SIZES = {
+    "BTCUSD": 0.1,
+    "ETHUSD": 0.01,
+    "XRPUSD": 0.0001,
+    "SOLUSD": 0.001,
+}
+
 
 @dataclass
 class BookLevel:
@@ -117,6 +125,12 @@ class L2OrderBook:
             if qty > 0:
                 self._asks[price] = qty
                 self._price_strs[price] = raw_ask_map.get(price, str(price))
+
+        while len(self._bids) > self.depth:
+            self._bids.popitem(-1)
+        while len(self._asks) > self.depth:
+            self._asks.popitem(-1)
+
         self.last_update_id = update_id
         self.exchange_ts_ms = exchange_ts_ms
         self.local_ts_ns    = time.monotonic_ns()
@@ -130,7 +144,8 @@ class L2OrderBook:
                     update_id: int = 0,
                     exchange_ts_ms: int = 0,
                     bids_raw: Optional[List[Tuple[str, str]]] = None,
-                    asks_raw: Optional[List[Tuple[str, str]]] = None) -> bool:
+                    asks_raw: Optional[List[Tuple[str, str]]] = None,
+                    l1_ref: Optional[dict] = None) -> bool:
         """
         Apply incremental diff update. Returns True if applied cleanly,
         False if rejected (duplicate seq, price sanity failure, or empty update).
@@ -143,6 +158,12 @@ class L2OrderBook:
         old_best_ask = self.best_ask.price if self.best_ask else None
         old_dwmp = self.dwmp(n_levels=10)
 
+        ref_bid = l1_ref.get("bid") if l1_ref else None
+        ref_ask = l1_ref.get("ask") if l1_ref else None
+
+        tick_size = DELTA_TICK_SIZES.get(self.symbol)
+        max_depth_range = tick_size * self.depth if tick_size else None
+
         raw_bid_map = {float(p): p for p, s in (bids_raw or [])}
         raw_ask_map = {float(p): p for p, s in (asks_raw or [])}
 
@@ -153,12 +174,27 @@ class L2OrderBook:
                 self._price_strs.pop(price, None)
                 valid_bids += 1
             else:
-                if old_best_bid and old_best_bid > 0:
-                    deviation = abs(price - old_best_bid) / old_best_bid
+                if tick_size and not self._price_aligned(price, tick_size):
+                    logger.warning(
+                        f"{self.symbol}: bid {price} not aligned to tick {tick_size}, "
+                        f"rejecting level. Raw update_id={update_id}"
+                    )
+                    continue
+
+                check_price = ref_bid or old_best_bid
+                if check_price and check_price > 0:
+                    if max_depth_range and price < check_price - max_depth_range:
+                        logger.warning(
+                            f"{self.symbol}: bid {price} outside depth {self.depth} range "
+                            f"from ref {check_price}, rejecting level. Raw update_id={update_id}"
+                        )
+                        continue
+
+                    deviation = abs(price - check_price) / check_price
                     if deviation > MAX_PRICE_DEVIATION:
                         logger.warning(
                             f"{self.symbol}: SUSPICIOUS bid {price} deviates "
-                            f"{deviation*100:.2f}% from best_bid {old_best_bid}, "
+                            f"{deviation*100:.2f}% from ref {check_price}, "
                             f"rejecting level. Raw update_id={update_id}"
                         )
                         continue
@@ -173,12 +209,27 @@ class L2OrderBook:
                 self._price_strs.pop(price, None)
                 valid_asks += 1
             else:
-                if old_best_ask and old_best_ask > 0:
-                    deviation = abs(price - old_best_ask) / old_best_ask
+                if tick_size and not self._price_aligned(price, tick_size):
+                    logger.warning(
+                        f"{self.symbol}: ask {price} not aligned to tick {tick_size}, "
+                        f"rejecting level. Raw update_id={update_id}"
+                    )
+                    continue
+
+                check_price = ref_ask or old_best_ask
+                if check_price and check_price > 0:
+                    if max_depth_range and price > check_price + max_depth_range:
+                        logger.warning(
+                            f"{self.symbol}: ask {price} outside depth {self.depth} range "
+                            f"from ref {check_price}, rejecting level. Raw update_id={update_id}"
+                        )
+                        continue
+
+                    deviation = abs(price - check_price) / check_price
                     if deviation > MAX_PRICE_DEVIATION:
                         logger.warning(
                             f"{self.symbol}: SUSPICIOUS ask {price} deviates "
-                            f"{deviation*100:.2f}% from best_ask {old_best_ask}, "
+                            f"{deviation*100:.2f}% from ref {check_price}, "
                             f"rejecting level. Raw update_id={update_id}"
                         )
                         continue
@@ -214,6 +265,12 @@ class L2OrderBook:
         self._update_count  += 1
         self._last_seq       = update_id
         return True
+
+    def _price_aligned(self, price: float, tick_size: float) -> bool:
+        if tick_size <= 0:
+            return True
+        remainder = round(price % tick_size, 10)
+        return remainder < tick_size * 0.001 or abs(remainder - tick_size) < tick_size * 0.001
 
     # ── Market data accessors ─────────────────────────────────────────────────
 

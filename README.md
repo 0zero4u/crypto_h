@@ -232,6 +232,48 @@ Corrupted level: 48000.0 (24% deviation)
 Result: REJECTED with warning
 ```
 
+### Tick Size Validation (Delta Exchange)
+
+Validates that price levels align to the exchange's tick size and are within depth range.
+
+**Delta Exchange Tick Sizes:**
+| Symbol | Precision | Tick Size | Example Price |
+|--------|-----------|-----------|---------------|
+| BTCUSD | 1 | 0.1 | 63000.0, 63000.1 |
+| ETHUSD | 2 | 0.01 | 1753.00, 1753.01 |
+| XRPUSD | 4 | 0.0001 | 0.5000, 0.5001 |
+| SOLUSD | 3 | 0.001 | 100.000, 100.001 |
+
+**Validation Rules:**
+1. Price must align to tick size (e.g., ETH price must be multiple of 0.01)
+2. Price must be within depth 20 range from L1 reference
+
+**Example:**
+```
+L1 best bid: 1753.00
+Tick size: 0.01
+Depth 20 range: 1753.00 to 1752.81 (20 levels × 0.01)
+
+Valid: 1752.99, 1752.98, ..., 1752.81
+Invalid: 1753.123 (wrong precision), 1550.00 (out of range)
+```
+
+### L1 Reference Validation (Delta Exchange)
+
+Uses `ob_l1` channel for real-time best bid/ask reference prices.
+
+**Why?** Validates orderbook updates against fresh exchange data instead of potentially corrupted book state.
+
+**Flow:**
+1. Subscribe to `ob_l1` for reference prices (updates every 100ms)
+2. Validate `ob_updates` against L1 reference
+3. Reject updates that deviate too much from L1
+
+**Benefits:**
+- ✅ Reference is always fresh (100ms updates)
+- ✅ No false positives during volatility
+- ✅ Works for all symbols automatically
+
 ### Sequence Validation
 
 Tracks `_last_seq` and rejects updates with `seq <= last_seq`.
@@ -259,7 +301,7 @@ Without conversion, volume would be inflated 1000x (40 * $63,000 = $2,520,000).
 
 | Module | Classes | Purpose |
 |--------|---------|---------|
-| `orderbook.py` | `L2OrderBook`, `BookLevel` | L2 book with DWMP calculation, CRC32 checksum, price-sanity checks |
+| `orderbook.py` | `L2OrderBook`, `BookLevel` | L2 book with DWMP, CRC32 checksum, tick size validation, L1 reference |
 | `feed.py` | `BinanceFeed`, `BybitFeed`, `GateIoFeed`, `DeltaFeed` | WebSocket feeds with trade support |
 | `normalizer.py` | (functions) | Exchange → canonical format (Binance, Bybit, Gate.io, Delta) |
 | `monitor.py` | `LatencyMonitor`, `FeedStats` | Latency tracking |

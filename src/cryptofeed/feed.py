@@ -537,6 +537,8 @@ class DeltaFeed(ExchangeFeed):
         super().__init__(symbols, depth, on_book_update, on_trade)
         self._last_seq: Dict[str, int] = {}
         self._synced: Dict[str, bool] = {s: False for s in symbols}
+        self._delta_buffer: Dict[str, list] = {s: [] for s in symbols}
+        self._l1_ref: Dict[str, dict] = {}
 
     @property
     def ws_url(self) -> str:
@@ -548,6 +550,7 @@ class DeltaFeed(ExchangeFeed):
             "payload": {
                 "channels": [
                     {"name": "ob_updates", "symbols": self.symbols},
+                    {"name": "ob_l1", "symbols": self.symbols},
                     {"name": "trades", "symbols": self.symbols},
                 ]
             }
@@ -562,9 +565,28 @@ class DeltaFeed(ExchangeFeed):
                 self.on_trade(trade_norm)
             return
 
+        if msg_type == "ob_l1":
+            self._handle_l1(msg)
+            return
+
         if msg_type == "ob_updates":
             self._handle_ob_update(msg)
             return
+
+    def _handle_l1(self, msg: dict):
+        symbol = msg.get("sy")
+        if not symbol:
+            return
+
+        bp = float(msg.get("bp", 0))
+        ap = float(msg.get("ap", 0))
+
+        if bp > 0 and ap > 0:
+            self._l1_ref[symbol] = {
+                "bid": bp,
+                "ask": ap,
+                "ts": msg.get("ts", 0),
+            }
 
     def _handle_ob_update(self, msg: dict):
         norm = normalize_delta_ob(msg)
@@ -599,6 +621,7 @@ class DeltaFeed(ExchangeFeed):
                 logger.info(f"Delta {symbol} snapshot loaded, seq={norm['update_id']}, "
                            f"top_bid={book.best_bid.price if book.best_bid else 'N/A'}, "
                            f"top_ask={book.best_ask.price if book.best_ask else 'N/A'}")
+                self._replay_buffered(symbol)
             else:
                 logger.warning(f"Delta {symbol}: snapshot REJECTED by price sanity check, "
                              f"seq={norm['update_id']}. Resubscribing...")
@@ -607,6 +630,7 @@ class DeltaFeed(ExchangeFeed):
             return
 
         if not self._synced.get(symbol, False):
+            self._delta_buffer[symbol].append(norm)
             return
 
         expected_seq = self._last_seq.get(symbol, 0) + 1
@@ -624,10 +648,13 @@ class DeltaFeed(ExchangeFeed):
         old_best_bid = book.best_bid.price if book.best_bid else None
         old_best_ask = book.best_ask.price if book.best_ask else None
 
+        l1_ref = self._l1_ref.get(symbol)
+
         ok = book.apply_diff(norm["bids"], norm["asks"],
                             norm["update_id"], norm["ts_ms"],
                             bids_raw=norm.get("bids_raw"),
-                            asks_raw=norm.get("asks_raw"))
+                            asks_raw=norm.get("asks_raw"),
+                            l1_ref=l1_ref)
 
         if not ok:
             logger.warning(f"Delta {symbol}: diff REJECTED (price sanity or duplicate seq), "
@@ -699,3 +726,34 @@ class DeltaFeed(ExchangeFeed):
             logger.info(f"Delta {symbol}: resubscribed for fresh snapshot")
         except Exception as e:
             logger.error(f"Delta {symbol} resubscribe error: {e}")
+
+    def _replay_buffered(self, symbol: str):
+        """Replay buffered deltas after snapshot arrives."""
+        buffer = self._delta_buffer.get(symbol, [])
+        if not buffer:
+            return
+
+        book = self.books.get(symbol)
+        if not book:
+            return
+
+        snapshot_seq = self._last_seq.get(symbol, 0)
+        applied = 0
+
+        l1_ref = self._l1_ref.get(symbol)
+
+        for norm in buffer:
+            if norm["update_id"] <= snapshot_seq:
+                continue
+
+            ok = book.apply_diff(norm["bids"], norm["asks"],
+                                norm["update_id"], norm["ts_ms"],
+                                bids_raw=norm.get("bids_raw"),
+                                asks_raw=norm.get("asks_raw"),
+                                l1_ref=l1_ref)
+            if ok:
+                self._last_seq[symbol] = norm["update_id"]
+                applied += 1
+
+        logger.info(f"Delta {symbol}: replayed {applied} buffered deltas")
+        self._delta_buffer[symbol] = []
