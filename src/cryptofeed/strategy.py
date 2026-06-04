@@ -191,7 +191,7 @@ class ZScoreSignal:
 
     ROUND_TRIP_FEE = 0.0006  # 0.06% round-trip
 
-    def __init__(self, threshold: float = 3.0, min_divergence_pct: float = 0.07):
+    def __init__(self, threshold: float = 2.0, min_divergence_pct: float = 0.02):
         self.threshold = threshold
         self.min_divergence_pct = min_divergence_pct
 

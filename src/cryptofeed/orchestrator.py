@@ -54,8 +54,8 @@ class DivergenceOrchestrator:
         n_levels: int = 20,
         volume_window_seconds: int = 60,
         divergence_window_minutes: int = 3,
-        z_threshold: float = 3.0,
-        min_divergence_pct: float = 0.07,
+        z_threshold: float = 2.0,
+        min_divergence_pct: float = 0.02,
         on_signal: Optional[Callable[[Signal], None]] = None,
         use_gateio: bool = False,
     ):
