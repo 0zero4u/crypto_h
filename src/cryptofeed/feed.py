@@ -11,7 +11,12 @@ from typing import List, Callable, Optional, Dict
 import orjson
 
 from .orderbook import L2OrderBook
-from .normalizer import normalize_binance_depth, normalize_bybit_depth
+from .normalizer import (
+    normalize_binance_depth,
+    normalize_bybit_depth,
+    normalize_binance_trade,
+    normalize_bybit_trade,
+)
 from .monitor import LatencyMonitor
 
 logger = logging.getLogger(__name__)
@@ -21,10 +26,12 @@ class ExchangeFeed(ABC):
     """Abstract base class for exchange WebSocket feeds."""
 
     def __init__(self, symbols: List[str], depth: int = 50,
-                 on_book_update: Optional[Callable] = None):
+                 on_book_update: Optional[Callable] = None,
+                 on_trade: Optional[Callable] = None):
         self.symbols = symbols
         self.depth   = depth
         self.on_book_update = on_book_update
+        self.on_trade = on_trade
         self.books: Dict[str, L2OrderBook] = {
             s: L2OrderBook(s, depth) for s in symbols
         }
@@ -102,14 +109,17 @@ class BinanceFeed(ExchangeFeed):
     """
     Binance WebSocket market data feed.
     Subscribes to <symbol>@depth<levels>@100ms streams.
+    Binance supports depth 5, 10, or 20 only.
     """
 
     BASE_WS = "wss://stream.binance.com:9443/stream"
+    MAX_DEPTH = 20  # Binance limit for partial book depth
 
     @property
     def ws_url(self) -> str:
+        depth = min(self.depth, self.MAX_DEPTH)
         streams = "/".join(
-            f"{s.lower()}@depth{self.depth}@100ms"
+            f"{s.lower()}@depth{depth}@100ms/{s.lower()}@trade"
             for s in self.symbols
         )
         return f"{self.BASE_WS}?streams={streams}"
@@ -119,6 +129,12 @@ class BinanceFeed(ExchangeFeed):
 
     def process_message(self, msg: dict):
         data = msg.get("data", msg)
+
+        trade_norm = normalize_binance_trade(data)
+        if trade_norm and self.on_trade:
+            self.on_trade(trade_norm)
+            return
+
         norm = normalize_binance_depth(data)
         if not norm:
             return
@@ -154,9 +170,15 @@ class BybitFeed(ExchangeFeed):
 
     def build_subscribe_message(self) -> dict:
         args = [f"orderbook.{self.depth}.{s}" for s in self.symbols]
+        args.extend(f"publicTrade.{s}" for s in self.symbols)
         return {"op": "subscribe", "args": args}
 
     def process_message(self, msg: dict):
+        trade_norm = normalize_bybit_trade(msg)
+        if trade_norm and self.on_trade:
+            self.on_trade(trade_norm)
+            return
+
         norm = normalize_bybit_depth(msg)
         if not norm:
             return

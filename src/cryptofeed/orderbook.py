@@ -165,6 +165,40 @@ class L2OrderBook:
             "latency_us": self.latency_us,
         }
 
+    def dwmp(self, n_levels: int = 10) -> Optional[float]:
+        """Depth-Weighted Mid Price using top N bid/ask levels.
+
+        Cross-weights bid prices by ask volume and vice versa.
+        Deeper liquidity pulls fair value toward that side.
+        Falls back to mid_price if book is empty.
+        """
+        if not self._bids or not self._asks:
+            return self.mid_price
+
+        bids = list(self._bids.items())[:n_levels]
+        asks = list(self._asks.items())[:n_levels]
+
+        n = min(len(bids), len(asks))
+        if n == 0:
+            return self.mid_price
+
+        numerator = 0.0
+        total_bid_vol = 0.0
+        total_ask_vol = 0.0
+
+        for i in range(n):
+            bid_price, bid_vol = bids[i]
+            ask_price, ask_vol = asks[i]
+            numerator += bid_price * ask_vol + ask_price * bid_vol
+            total_bid_vol += bid_vol
+            total_ask_vol += ask_vol
+
+        denominator = total_bid_vol + total_ask_vol
+        if denominator == 0:
+            return self.mid_price
+
+        return numerator / denominator
+
     def __repr__(self) -> str:
         bb = self.best_bid
         ba = self.best_ask
