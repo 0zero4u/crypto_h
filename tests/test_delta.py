@@ -1,6 +1,6 @@
 """Tests for Delta Exchange normalizers."""
 import pytest
-from cryptofeed.normalizer import normalize_delta_ob, normalize_delta_trade
+from cryptofeed.normalizer import normalize_delta_ob, normalize_delta_trade, normalize_delta_l1
 
 
 class TestDeltaOB:
@@ -38,6 +38,49 @@ class TestDeltaOB:
             "type": "ob_updates",
         }
         assert normalize_delta_ob(msg) is None
+
+
+class TestDeltaL1:
+    def test_l1_basic(self):
+        msg = {
+            "ap": "68519.0",
+            "as": "285",
+            "bp": "68518.0",
+            "bs": "2452",
+            "lts": 1775037882675402,
+            "sy": "BTCUSD",
+            "ts": 1775037882748105,
+            "type": "ob_l1",
+        }
+        norm = normalize_delta_l1(msg)
+        assert norm is not None
+        assert norm["symbol"] == "BTCUSD"
+        assert norm["exchange"] == "delta"
+        assert norm["bid"] == 68518.0
+        assert norm["ask"] == 68519.0
+        assert norm["bid_size"] == 2452.0
+        assert norm["ask_size"] == 285.0
+        assert norm["mid_price"] == 68518.5
+        assert norm["ts_ms"] == 1775037882675
+
+    def test_l1_wrong_type(self):
+        msg = {"type": "trades", "sy": "BTCUSD"}
+        assert normalize_delta_l1(msg) is None
+
+    def test_l1_missing_prices(self):
+        msg = {"type": "ob_l1", "sy": "BTCUSD", "bp": "100.0"}
+        assert normalize_delta_l1(msg) is None
+
+    def test_l1_zero_prices(self):
+        msg = {
+            "ap": "0.0",
+            "as": "285",
+            "bp": "0.0",
+            "bs": "2452",
+            "sy": "BTCUSD",
+            "type": "ob_l1",
+        }
+        assert normalize_delta_l1(msg) is None
 
 
 class TestDeltaTrade:

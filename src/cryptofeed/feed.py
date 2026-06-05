@@ -18,6 +18,7 @@ from .normalizer import (
     normalize_bybit_trade,
     normalize_delta_ob,
     normalize_delta_trade,
+    normalize_delta_l1,
 )
 from .monitor import LatencyMonitor
 
@@ -111,13 +112,13 @@ class BinanceFeed(ExchangeFeed):
     """
     Binance futures WebSocket market data feed.
     Requires TWO connections: /market for aggTrade, /public for depth.
-    Binance supports depth 5, 10, or 20 only.
+    Uses depth5@0ms for real-time top 5 level updates.
     """
 
     BASE_WS = "wss://fstream.binance.com"
-    MAX_DEPTH = 20
+    MAX_DEPTH = 5
 
-    def __init__(self, symbols, depth=20, on_book_update=None, on_trade=None):
+    def __init__(self, symbols, depth=5, on_book_update=None, on_trade=None):
         super().__init__(symbols, depth, on_book_update, on_trade)
         self._trade_ws = None
         self._depth_ws = None
@@ -131,7 +132,7 @@ class BinanceFeed(ExchangeFeed):
     @property
     def _depth_url(self) -> str:
         depth = min(self.depth, self.MAX_DEPTH)
-        streams = "/".join(f"{s.lower()}@depth{depth}@100ms" for s in self.symbols)
+        streams = "/".join(f"{s.lower()}@depth{depth}@0ms" for s in self.symbols)
         return f"{self.BASE_WS}/public/stream?streams={streams}"
 
     @property
@@ -520,19 +521,23 @@ class DeltaFeed(ExchangeFeed):
     """
     Delta Exchange WebSocket market data feed.
 
-    Uses ob_l2 channel for orderbook (top 15 levels snapshot at ~500ms)
+    Uses ob_l1 channel for best bid/ask updates (~100ms)
     and trades channel for trade data.
+
+    Since ob_l1 only provides top-of-book, we use mid-price
+    as the fair value instead of DWMP.
 
     Endpoint: wss://public-socket.india.delta.exchange
     """
 
     BASE_WS = "wss://public-socket.india.delta.exchange"
 
-    def __init__(self, symbols: List[str], depth: int = 20,
+    def __init__(self, symbols: List[str], depth: int = 1,
                  on_book_update: Optional[Callable] = None,
                  on_trade: Optional[Callable] = None):
         super().__init__(symbols, depth, on_book_update, on_trade)
         self._last_ts: Dict[str, int] = {}
+        self._mid_prices: Dict[str, float] = {}
 
     @property
     def ws_url(self) -> str:
@@ -543,11 +548,14 @@ class DeltaFeed(ExchangeFeed):
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "ob_l2", "symbols": self.symbols},
+                    {"name": "ob_l1", "symbols": self.symbols},
                     {"name": "trades", "symbols": self.symbols},
                 ]
             }
         }
+
+    def get_mid_price(self, symbol: str) -> Optional[float]:
+        return self._mid_prices.get(symbol)
 
     def process_message(self, msg: dict):
         msg_type = msg.get("type")
@@ -558,64 +566,37 @@ class DeltaFeed(ExchangeFeed):
                 self.on_trade(trade_norm)
             return
 
-        if msg_type == "ob_l2":
-            self._handle_ob_update(msg)
+        if msg_type == "ob_l1":
+            self._handle_l1(msg)
             return
 
-    def _handle_ob_update(self, msg: dict):
-        norm = normalize_delta_ob(msg)
+    def _handle_l1(self, msg: dict):
+        norm = normalize_delta_l1(msg)
         if not norm:
             return
 
         symbol = norm["symbol"]
-        book = self.books.get(symbol)
-        if not book:
-            return
-
-        update_id = norm["update_id"]
+        ts_ms = norm["ts_ms"]
         last_ts = self._last_ts.get(symbol, 0)
 
-        if update_id <= last_ts:
+        if ts_ms <= last_ts:
             return
 
-        old_dwmp = book.dwmp(n_levels=15)
-        old_best_bid = book.best_bid.price if book.best_bid else None
-        old_best_ask = book.best_ask.price if book.best_ask else None
+        self._last_ts[symbol] = ts_ms
+        self._mid_prices[symbol] = norm["mid_price"]
 
-        ok = book.apply_snapshot(norm["bids"], norm["asks"],
-                                norm["update_id"], norm["ts_ms"],
-                                bids_raw=norm.get("bids_raw"),
-                                asks_raw=norm.get("asks_raw"))
+        book = self.books.get(symbol)
+        if book:
+            book.apply_snapshot(
+                [(norm["bid"], norm["bid_size"])],
+                [(norm["ask"], norm["ask_size"])],
+                ts_ms, ts_ms
+            )
 
-        if not ok:
-            logger.warning(f"Delta {symbol}: snapshot REJECTED by price sanity check")
-            return
-
-        self._last_ts[symbol] = update_id
-
-        new_dwmp = book.dwmp(n_levels=15)
-        new_best_bid = book.best_bid.price if book.best_bid else None
-        new_best_ask = book.best_ask.price if book.best_ask else None
-
-        if old_dwmp and new_dwmp:
-            change_pct = abs(new_dwmp - old_dwmp) / old_dwmp * 100
-            if change_pct > 0.1:
-                logger.warning(
-                    f"Delta {symbol}: *** SPIKE *** {old_dwmp:.2f} -> {new_dwmp:.2f} "
-                    f"({change_pct:.4f}%) ts_ms={norm['ts_ms']}"
-                )
-                logger.warning(f"  Bid: {old_best_bid} -> {new_best_bid}")
-                logger.warning(f"  Ask: {old_best_ask} -> {new_best_ask}")
-                logger.warning(f"  Update bids: {norm['bids'][:5]}")
-                logger.warning(f"  Update asks: {norm['asks'][:5]}")
-                logger.warning(f"  Book bids top3: {list(book._bids.items())[:3]}")
-                logger.warning(f"  Book asks top3: {list(book._asks.items())[:3]}")
-                logger.warning(f"  Raw msg: {msg}")
-
-        ts_ns = time.monotonic_ns()
-        self.monitor.record(symbol, norm["ts_ms"], ts_ns)
-        if self.on_book_update:
-            self.on_book_update(book)
+            ts_ns = time.monotonic_ns()
+            self.monitor.record(symbol, ts_ms, ts_ns)
+            if self.on_book_update:
+                self.on_book_update(book)
 
     async def _resubscribe(self, symbol: str):
         if not self._ws:
@@ -626,7 +607,7 @@ class DeltaFeed(ExchangeFeed):
                 "type": "unsubscribe",
                 "payload": {
                     "channels": [
-                        {"name": "ob_l2", "symbols": [symbol]},
+                        {"name": "ob_l1", "symbols": [symbol]},
                     ]
                 }
             }
@@ -636,12 +617,12 @@ class DeltaFeed(ExchangeFeed):
                 "type": "subscribe",
                 "payload": {
                     "channels": [
-                        {"name": "ob_l2", "symbols": [symbol]},
+                        {"name": "ob_l1", "symbols": [symbol]},
                     ]
                 }
             }
             await self._ws.send(orjson.dumps(sub_msg).decode())
-            logger.info(f"Delta {symbol}: resubscribed for fresh snapshot")
+            logger.info(f"Delta {symbol}: resubscribed for fresh L1 data")
         except Exception as e:
             logger.error(f"Delta {symbol} resubscribe error: {e}")
 

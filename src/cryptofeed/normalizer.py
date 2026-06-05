@@ -372,3 +372,52 @@ def normalize_delta_trade(msg: dict) -> Optional[dict]:
         "ts_ms":    ts_ms,
         "side":     side,
     }
+
+
+def normalize_delta_l1(msg: dict) -> Optional[dict]:
+    """
+    Parse Delta Exchange ob_l1 WebSocket message.
+
+    ob_l1 provides best bid/ask updates at ~100ms intervals.
+
+    Delta format:
+    {
+      "ap": "68519.0",   // best ask price
+      "as": "285",       // best ask size (contracts)
+      "bp": "68518.0",   // best bid price
+      "bs": "2452",      // best bid size (contracts)
+      "lts": 1775037882675402,  // last orderbook updated timestamp (microseconds)
+      "sy": "BTCUSD",    // symbol
+      "ts": 1775037882748105,   // publish timestamp (microseconds)
+      "type": "ob_l1"
+    }
+    """
+    msg_type = msg.get("type")
+    if msg_type != "ob_l1":
+        return None
+
+    bp = msg.get("bp")
+    ap = msg.get("ap")
+    if bp is None or ap is None:
+        return None
+
+    bp = float(bp)
+    ap = float(ap)
+
+    if bp <= 0 or ap <= 0:
+        return None
+
+    lts_us = msg.get("lts", 0)
+    ts_us = msg.get("ts", 0)
+    ts_ms = (lts_us or ts_us) // 1000 if (lts_us or ts_us) > 0 else 0
+
+    return {
+        "symbol":    msg.get("sy", "UNKNOWN"),
+        "exchange":  "delta",
+        "ts_ms":     ts_ms,
+        "bid":       bp,
+        "ask":       ap,
+        "bid_size":  float(msg.get("bs", 0)),
+        "ask_size":  float(msg.get("as", 0)),
+        "mid_price": (bp + ap) / 2,
+    }

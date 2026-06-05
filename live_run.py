@@ -112,7 +112,7 @@ async def main():
     logger.info("=" * 60)
     
     orch = DivergenceOrchestrator(
-        symbols=["ETHUSDT"],
+        symbols=["BTCUSDT"],
         depth=20,
         n_levels=20,
         z_threshold=2.0,
@@ -120,7 +120,7 @@ async def main():
         on_signal=on_signal,
         use_gateio=True,
         use_delta=True,
-        delta_symbols=["ETHUSD"],
+        delta_symbols=["BTCUSD"],
     )
     
     # Start orchestrator

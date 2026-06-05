@@ -13,9 +13,9 @@ from cryptofeed.strategy import TradeCollector, GlobalFairValue, DivergenceTrack
 
 # Track everything
 stats = {
-    "ob_l2": 0,
+    "ob_l1": 0,
     "trades": 0,
-    "dwmp_values": [],
+    "mid_prices": [],
     "gfv_values": [],
     "divergence_values": [],
 }
@@ -26,14 +26,14 @@ div_tracker = DivergenceTracker(window_minutes=3)
 
 
 def on_book(book: L2OrderBook):
-    stats["ob_l2"] += 1
+    stats["ob_l1"] += 1
     
-    dwmp = book.dwmp(n_levels=15)
-    if dwmp:
-        stats["dwmp_values"].append(dwmp)
+    mid = book.mid_price
+    if mid:
+        stats["mid_prices"].append(mid)
         
-        # Update GFV
-        gfv.update_dwmp("delta", dwmp)
+        # Update GFV with mid-price (not DWMP)
+        gfv.update_dwmp("delta", mid)
         result = gfv.compute()
         
         if result:
@@ -41,7 +41,7 @@ def on_book(book: L2OrderBook):
             stats["gfv_values"].append(gfv_val)
             
             # Compute divergence
-            div_pct = (dwmp - gfv_val) / gfv_val * 100 if gfv_val != 0 else 0
+            div_pct = (mid - gfv_val) / gfv_val * 100 if gfv_val != 0 else 0
             stats["divergence_values"].append(div_pct)
             
             # Record for rolling stats
@@ -51,8 +51,8 @@ def on_book(book: L2OrderBook):
             # Check if we have enough data for stats
             div_stats = div_tracker.get_stats("delta")
             
-            if stats["ob_l2"] <= 5 or stats["ob_l2"] % 100 == 0:
-                print(f"[OB #{stats['ob_l2']}] DWMP={dwmp:.2f} GFV={gfv_val:.2f} "
+            if stats["ob_l1"] <= 5 or stats["ob_l1"] % 100 == 0:
+                print(f"[L1 #{stats['ob_l1']}] Mid={mid:.2f} GFV={gfv_val:.2f} "
                       f"Div={div_pct:.4f}% Weights={weights}")
                 if div_stats:
                     mean, std = div_stats
@@ -89,7 +89,7 @@ async def main():
     
     feed = DeltaFeed(
         symbols=["BTCUSD"],
-        depth=20,
+        depth=1,
         on_book_update=on_book,
         on_trade=on_trade,
     )
@@ -106,9 +106,9 @@ async def main():
             print(f"\n{'='*60}")
             print(f"30s CHECKPOINT")
             print(f"{'='*60}")
-            print(f"OB updates: {stats['ob_l2']}")
+            print(f"L1 updates: {stats['ob_l1']}")
             print(f"Trades: {stats['trades']}")
-            print(f"DWMP samples: {len(stats['dwmp_values'])}")
+            print(f"Mid-price samples: {len(stats['mid_prices'])}")
             print(f"GFV samples: {len(stats['gfv_values'])}")
             print(f"Divergence samples: {len(stats['divergence_values'])}")
             
@@ -141,9 +141,9 @@ async def main():
     print("\n" + "=" * 60)
     print("FINAL RESULTS")
     print("=" * 60)
-    print(f"OB updates: {stats['ob_l2']}")
+    print(f"L1 updates: {stats['ob_l1']}")
     print(f"Trades: {stats['trades']}")
-    print(f"DWMP samples: {len(stats['dwmp_values'])}")
+    print(f"Mid-price samples: {len(stats['mid_prices'])}")
     print(f"GFV samples: {len(stats['gfv_values'])}")
     print(f"Divergence samples: {len(stats['divergence_values'])}")
     
