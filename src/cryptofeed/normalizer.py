@@ -279,61 +279,47 @@ def normalize_gateio_trade(msg: dict) -> Optional[dict]:
 
 def normalize_delta_ob(msg: dict) -> Optional[dict]:
     """
-    Parse Delta Exchange ob_updates WebSocket message.
+    Parse Delta Exchange ob_l2 WebSocket message.
 
-    Delta format (snapshot):
-    {
-      "action": "snapshot",
-      "a": [["16919.0", "1087"], ["16919.5", "1193"]],
-      "b": [["16918.0", "602"], ["16917.5", "1792"]],
-      "ts": 1671140718980723,   // microseconds
-      "seq": 6199,
-      "sy": "BTCUSD",
-      "type": "ob_updates",
-      "cs": 2178756498          // checksum (CRC32)
-    }
+    ob_l2 provides top 15 levels of orderbook data at ~500ms intervals.
+    Always a full snapshot (no incremental updates).
 
-    Delta format (update):
+    Delta format:
     {
-      "action": "update",
-      "a": [["16919.0", "0"], ["16919.5", "710"]],   // size 0 = delete
-      "b": [["16918.5", "304"]],
-      "seq": 6200,
-      "sy": "BTCUSD",
-      "type": "ob_updates",
-      "ts": 1671140769059031,
-      "cs": 3409694612
+      "a": [["68525.0", "3313"], ["68525.5", "3009"], ...],  // asks (top 15)
+      "b": [["68524.0", "2452"], ["68523.5", "3000"], ...],  // bids (top 15)
+      "lts": 1775038313132415,  // last orderbook updated timestamp (microseconds)
+      "sy": "BTCUSD",           // symbol
+      "ts": 1775038313632092,   // publish timestamp (microseconds)
+      "type": "ob_l2"
     }
     """
     msg_type = msg.get("type")
-    if msg_type != "ob_updates":
-        return None
-
-    action = msg.get("action")
-    if action not in ("snapshot", "update"):
+    if msg_type != "ob_l2":
         return None
 
     def parse_levels(raw: list) -> List[Tuple[float, float]]:
         return [(float(p), float(s)) for p, s in raw]
 
-    # Convert microseconds to milliseconds
+    lts_us = msg.get("lts", 0)
     ts_us = msg.get("ts", 0)
-    ts_ms = ts_us // 1000 if ts_us > 0 else 0
+    ts_ms = (lts_us or ts_us) // 1000 if (lts_us or ts_us) > 0 else 0
 
     raw_bids = msg.get("b", [])
     raw_asks = msg.get("a", [])
 
+    update_id = lts_us or ts_us
+
     return {
-        "type":      "snapshot" if action == "snapshot" else "diff",
+        "type":      "snapshot",
         "symbol":    msg.get("sy", "UNKNOWN"),
         "exchange":  "delta",
         "ts_ms":     ts_ms,
-        "update_id": msg.get("seq", 0),
+        "update_id": update_id,
         "bids":      parse_levels(raw_bids),
         "asks":      parse_levels(raw_asks),
         "bids_raw":  raw_bids,
         "asks_raw":  raw_asks,
-        "cs":        msg.get("cs", 0),
     }
 
 

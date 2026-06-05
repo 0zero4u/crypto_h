@@ -21,10 +21,9 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 │  Bybit (stream.bybit.com/v5/public/linear) ──► BybitFeed ──► Normalizer    │
 │  Gate.io (fx-ws.gateio.ws/v4/ws/usdt) ──► GateIoFeed ──► Normalizer        │
 │  Delta (public-socket.india.delta.exchange) ──► DeltaFeed ──► Normalizer    │
-│                (REST snapshot + delta merge with sequence sync)             │
+│                (ob_l2 snapshots every 500ms, top 15 levels)                 │
 │                            │                                                │
 │                       LatencyMonitor (µs-precision)                         │
-│                       CRC32 Checksum Validation (Delta)                     │
 │                       Price-Sanity Checks (5% deviation)                    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -34,7 +33,7 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │   ┌─────────────┐    ┌──────────────────┐    ┌─────────────────────┐       │
-│   │ DWMP(N=20)  │───►│ GlobalFairValue  │───►│ DivergenceTracker   │       │
+│   │ DWMP(N=15)  │───►│ GlobalFairValue  │───►│ DivergenceTracker   │       │
 │   │ per exchange │    │ (volume-weighted)│    │ (3-min µ, σ)        │       │
 │   └─────────────┘    └──────────────────┘    └──────────┬──────────┘       │
 │                              ▲                           │                  │
@@ -59,7 +58,7 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 - **Async WebSocket feeds**: Binance, Bybit, Gate.io, and Delta Exchange futures with auto-reconnect
 - **L2 book reconstruction**: Full snapshot + incremental diff updates
 - **Gate.io sync**: REST snapshot + WebSocket delta merge with sequence ID tracking
-- **Delta Exchange sync**: CRC32 checksum validation, contract-to-base conversion
+- **Delta Exchange sync**: ob_l2 snapshots every 500ms, top 15 levels, timestamp-based dedup
 - **SortedDict book**: O(log N) updates, O(1) best bid/ask, depth trimming
 - **Exchange normalizer**: Unified canonical format across venues
 - **Latency monitoring**: P50/P99/P99.9 exchange-to-local latency
@@ -150,7 +149,7 @@ All exchanges use **futures** markets with **individual trade** streams for fair
 DWMP = (Σ Bid_i × AskVol_i + Σ Ask_i × BidVol_i) / (Σ BidVol_i + Σ AskVol_i)
 ```
 
-Where N=20 levels. Deeper liquidity pulls fair value toward that side.
+Where N=15 levels for Delta (ob_l2 limit), N=20 for other exchanges. Deeper liquidity pulls fair value toward that side.
 
 ### Global Fair Value
 
@@ -201,24 +200,6 @@ Signals require **both** conditions:
 
 ## Data Integrity
 
-### CRC32 Checksum Validation (Delta Exchange)
-
-Delta Exchange provides a `cs` (checksum) field in every `ob_updates` message for data integrity verification.
-
-**Calculation:**
-1. Take top 10 bid/ask levels (sorted: asks ascending, bids descending)
-2. Format: `price0:size0,price1:size1,...,price9:size9`
-3. Concatenate: `asks_string + "|" + bids_string`
-4. Calculate CRC32 (unsigned 32-bit integer)
-
-**Example:**
-```
-asks = [["100.00", "23"], ["100.05", "34"]]
-bids = [["99.04", "87"], ["98.65", "102"], ["98.30", "16"]]
-checksum_string = "100.00:23,100.05:34|99.04:87,98.65:102,98.30:16"
-CRC32 = 3599895312
-```
-
 ### Price-Sanity Validation
 
 Rejects orderbook levels that deviate >5% from current best price on the same side.
@@ -246,39 +227,28 @@ Validates that price levels align to the exchange's tick size and are within dep
 
 **Validation Rules:**
 1. Price must align to tick size (e.g., ETH price must be multiple of 0.01)
-2. Price must be within depth 20 range from L1 reference
+2. Price must be within depth 15 range from best price
 
 **Example:**
 ```
-L1 best bid: 1753.00
+Best bid: 1753.00
 Tick size: 0.01
-Depth 20 range: 1753.00 to 1752.81 (20 levels × 0.01)
+Depth 15 range: 1753.00 to 1752.85 (15 levels × 0.01)
 
-Valid: 1752.99, 1752.98, ..., 1752.81
+Valid: 1752.99, 1752.98, ..., 1752.85
 Invalid: 1753.123 (wrong precision), 1550.00 (out of range)
 ```
 
-### L1 Reference Validation (Delta Exchange)
+### Timestamp-Based Deduplication (Delta Exchange)
 
-Uses `ob_l1` channel for real-time best bid/ask reference prices.
+Since `ob_l2` provides snapshots (not incremental updates), we use timestamps for deduplication instead of sequence numbers.
 
-**Why?** Validates orderbook updates against fresh exchange data instead of potentially corrupted book state.
+**How it works:**
+- Each `ob_l2` message includes `lts` (last orderbook updated timestamp) and `ts` (publish timestamp)
+- We track the last processed timestamp per symbol
+- Messages with `timestamp <= last_timestamp` are skipped
 
-**Flow:**
-1. Subscribe to `ob_l1` for reference prices (updates every 100ms)
-2. Validate `ob_updates` against L1 reference
-3. Reject updates that deviate too much from L1
-
-**Benefits:**
-- ✅ Reference is always fresh (100ms updates)
-- ✅ No false positives during volatility
-- ✅ Works for all symbols automatically
-
-### Sequence Validation
-
-Tracks `_last_seq` and rejects updates with `seq <= last_seq`.
-
-**Why?** Prevents duplicate/corrupted sequence number replays from corrupting book state.
+**Why?** Prevents processing duplicate snapshots when the same data is published multiple times.
 
 ### Contract Size Conversion (Delta Exchange)
 
@@ -301,7 +271,7 @@ Without conversion, volume would be inflated 1000x (40 * $63,000 = $2,520,000).
 
 | Module | Classes | Purpose |
 |--------|---------|---------|
-| `orderbook.py` | `L2OrderBook`, `BookLevel` | L2 book with DWMP, CRC32 checksum, tick size validation, L1 reference |
+| `orderbook.py` | `L2OrderBook`, `BookLevel` | L2 book with DWMP, tick size validation |
 | `feed.py` | `BinanceFeed`, `BybitFeed`, `GateIoFeed`, `DeltaFeed` | WebSocket feeds with trade support |
 | `normalizer.py` | (functions) | Exchange → canonical format (Binance, Bybit, Gate.io, Delta) |
 | `monitor.py` | `LatencyMonitor`, `FeedStats` | Latency tracking |

@@ -162,7 +162,6 @@ class L2OrderBook:
         ref_ask = l1_ref.get("ask") if l1_ref else None
 
         tick_size = DELTA_TICK_SIZES.get(self.symbol)
-        max_depth_range = tick_size * self.depth if tick_size else None
 
         raw_bid_map = {float(p): p for p, s in (bids_raw or [])}
         raw_ask_map = {float(p): p for p, s in (asks_raw or [])}
@@ -183,13 +182,6 @@ class L2OrderBook:
 
                 check_price = ref_bid or old_best_bid
                 if check_price and check_price > 0:
-                    if max_depth_range and price < check_price - max_depth_range:
-                        logger.warning(
-                            f"{self.symbol}: bid {price} outside depth {self.depth} range "
-                            f"from ref {check_price}, rejecting level. Raw update_id={update_id}"
-                        )
-                        continue
-
                     deviation = abs(price - check_price) / check_price
                     if deviation > MAX_PRICE_DEVIATION:
                         logger.warning(
@@ -218,13 +210,6 @@ class L2OrderBook:
 
                 check_price = ref_ask or old_best_ask
                 if check_price and check_price > 0:
-                    if max_depth_range and price > check_price + max_depth_range:
-                        logger.warning(
-                            f"{self.symbol}: ask {price} outside depth {self.depth} range "
-                            f"from ref {check_price}, rejecting level. Raw update_id={update_id}"
-                        )
-                        continue
-
                     deviation = abs(price - check_price) / check_price
                     if deviation > MAX_PRICE_DEVIATION:
                         logger.warning(

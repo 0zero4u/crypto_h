@@ -520,11 +520,8 @@ class DeltaFeed(ExchangeFeed):
     """
     Delta Exchange WebSocket market data feed.
 
-    Uses ob_updates channel for orderbook (snapshot + incremental deltas)
+    Uses ob_l2 channel for orderbook (top 15 levels snapshot at ~500ms)
     and trades channel for trade data.
-
-    Unlike Gate.io, Delta sends the initial snapshot over WebSocket,
-    so no REST fetch is needed. Sequence tracking via 'seq' field.
 
     Endpoint: wss://public-socket.india.delta.exchange
     """
@@ -535,10 +532,7 @@ class DeltaFeed(ExchangeFeed):
                  on_book_update: Optional[Callable] = None,
                  on_trade: Optional[Callable] = None):
         super().__init__(symbols, depth, on_book_update, on_trade)
-        self._last_seq: Dict[str, int] = {}
-        self._synced: Dict[str, bool] = {s: False for s in symbols}
-        self._delta_buffer: Dict[str, list] = {s: [] for s in symbols}
-        self._l1_ref: Dict[str, dict] = {}
+        self._last_ts: Dict[str, int] = {}
 
     @property
     def ws_url(self) -> str:
@@ -549,8 +543,7 @@ class DeltaFeed(ExchangeFeed):
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "ob_updates", "symbols": self.symbols},
-                    {"name": "ob_l1", "symbols": self.symbols},
+                    {"name": "ob_l2", "symbols": self.symbols},
                     {"name": "trades", "symbols": self.symbols},
                 ]
             }
@@ -565,28 +558,9 @@ class DeltaFeed(ExchangeFeed):
                 self.on_trade(trade_norm)
             return
 
-        if msg_type == "ob_l1":
-            self._handle_l1(msg)
-            return
-
-        if msg_type == "ob_updates":
+        if msg_type == "ob_l2":
             self._handle_ob_update(msg)
             return
-
-    def _handle_l1(self, msg: dict):
-        symbol = msg.get("sy")
-        if not symbol:
-            return
-
-        bp = float(msg.get("bp", 0))
-        ap = float(msg.get("ap", 0))
-
-        if bp > 0 and ap > 0:
-            self._l1_ref[symbol] = {
-                "bid": bp,
-                "ask": ap,
-                "ts": msg.get("ts", 0),
-            }
 
     def _handle_ob_update(self, msg: dict):
         norm = normalize_delta_ob(msg)
@@ -598,64 +572,28 @@ class DeltaFeed(ExchangeFeed):
         if not book:
             return
 
-        action = msg.get("action")
+        update_id = norm["update_id"]
+        last_ts = self._last_ts.get(symbol, 0)
 
-        if action == "snapshot":
-            ok = book.apply_snapshot(norm["bids"], norm["asks"],
-                                    norm["update_id"], norm["ts_ms"],
-                                    bids_raw=norm.get("bids_raw"),
-                                    asks_raw=norm.get("asks_raw"))
-            if ok:
-                self._last_seq[symbol] = norm["update_id"]
-                self._synced[symbol] = True
-                logger.info(f"Delta {symbol} snapshot loaded, seq={norm['update_id']}, "
-                           f"top_bid={book.best_bid.price if book.best_bid else 'N/A'}, "
-                           f"top_ask={book.best_ask.price if book.best_ask else 'N/A'}")
-                self._replay_buffered(symbol)
-            else:
-                logger.warning(f"Delta {symbol}: snapshot REJECTED by price sanity check, "
-                             f"seq={norm['update_id']}. Resubscribing...")
-                self._synced[symbol] = False
-                asyncio.create_task(self._resubscribe(symbol))
+        if update_id <= last_ts:
             return
 
-        if not self._synced.get(symbol, False):
-            self._delta_buffer[symbol].append(norm)
-            return
-
-        expected_seq = self._last_seq.get(symbol, 0) + 1
-        actual_seq = norm["update_id"]
-
-        if actual_seq != expected_seq:
-            logger.warning(f"Delta {symbol}: sequence gap, "
-                         f"expected {expected_seq}, got {actual_seq}. Resubscribing...")
-            self._synced[symbol] = False
-            self._last_seq.pop(symbol, None)
-            asyncio.create_task(self._resubscribe(symbol))
-            return
-
-        old_dwmp = book.dwmp(n_levels=20)
+        old_dwmp = book.dwmp(n_levels=15)
         old_best_bid = book.best_bid.price if book.best_bid else None
         old_best_ask = book.best_ask.price if book.best_ask else None
 
-        l1_ref = self._l1_ref.get(symbol)
-
-        ok = book.apply_diff(norm["bids"], norm["asks"],
-                            norm["update_id"], norm["ts_ms"],
-                            bids_raw=norm.get("bids_raw"),
-                            asks_raw=norm.get("asks_raw"),
-                            l1_ref=l1_ref)
+        ok = book.apply_snapshot(norm["bids"], norm["asks"],
+                                norm["update_id"], norm["ts_ms"],
+                                bids_raw=norm.get("bids_raw"),
+                                asks_raw=norm.get("asks_raw"))
 
         if not ok:
-            logger.warning(f"Delta {symbol}: diff REJECTED (price sanity or duplicate seq), "
-                         f"seq={actual_seq}. Waiting for resync...")
-            self._synced[symbol] = False
-            asyncio.create_task(self._resubscribe(symbol))
+            logger.warning(f"Delta {symbol}: snapshot REJECTED by price sanity check")
             return
 
-        self._last_seq[symbol] = actual_seq
+        self._last_ts[symbol] = update_id
 
-        new_dwmp = book.dwmp(n_levels=20)
+        new_dwmp = book.dwmp(n_levels=15)
         new_best_bid = book.best_bid.price if book.best_bid else None
         new_best_ask = book.best_ask.price if book.best_ask else None
 
@@ -664,7 +602,7 @@ class DeltaFeed(ExchangeFeed):
             if change_pct > 0.1:
                 logger.warning(
                     f"Delta {symbol}: *** SPIKE *** {old_dwmp:.2f} -> {new_dwmp:.2f} "
-                    f"({change_pct:.4f}%) seq={actual_seq} ts_ms={norm['ts_ms']}"
+                    f"({change_pct:.4f}%) ts_ms={norm['ts_ms']}"
                 )
                 logger.warning(f"  Bid: {old_best_bid} -> {new_best_bid}")
                 logger.warning(f"  Ask: {old_best_ask} -> {new_best_ask}")
@@ -688,7 +626,7 @@ class DeltaFeed(ExchangeFeed):
                 "type": "unsubscribe",
                 "payload": {
                     "channels": [
-                        {"name": "ob_updates", "symbols": [symbol]},
+                        {"name": "ob_l2", "symbols": [symbol]},
                     ]
                 }
             }
@@ -698,7 +636,7 @@ class DeltaFeed(ExchangeFeed):
                 "type": "subscribe",
                 "payload": {
                     "channels": [
-                        {"name": "ob_updates", "symbols": [symbol]},
+                        {"name": "ob_l2", "symbols": [symbol]},
                     ]
                 }
             }
@@ -707,33 +645,4 @@ class DeltaFeed(ExchangeFeed):
         except Exception as e:
             logger.error(f"Delta {symbol} resubscribe error: {e}")
 
-    def _replay_buffered(self, symbol: str):
-        """Replay buffered deltas after snapshot arrives."""
-        buffer = self._delta_buffer.get(symbol, [])
-        if not buffer:
-            return
 
-        book = self.books.get(symbol)
-        if not book:
-            return
-
-        snapshot_seq = self._last_seq.get(symbol, 0)
-        applied = 0
-
-        l1_ref = self._l1_ref.get(symbol)
-
-        for norm in buffer:
-            if norm["update_id"] <= snapshot_seq:
-                continue
-
-            ok = book.apply_diff(norm["bids"], norm["asks"],
-                                norm["update_id"], norm["ts_ms"],
-                                bids_raw=norm.get("bids_raw"),
-                                asks_raw=norm.get("asks_raw"),
-                                l1_ref=l1_ref)
-            if ok:
-                self._last_seq[symbol] = norm["update_id"]
-                applied += 1
-
-        logger.info(f"Delta {symbol}: replayed {applied} buffered deltas")
-        self._delta_buffer[symbol] = []
