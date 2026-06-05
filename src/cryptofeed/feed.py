@@ -558,11 +558,37 @@ class DeltaFeed(ExchangeFeed):
     """
 
     BASE_WS = "wss://public-socket.india.delta.exchange"
+    PRODUCTS_API = "https://api.delta.exchange/v2/products"
 
     def __init__(self, symbols: List[str], depth: int = 1,
                  on_book_update: Optional[Callable] = None,
                  on_trade: Optional[Callable] = None):
         super().__init__(symbols, depth, on_book_update, on_trade)
+        self._contract_sizes: Dict[str, float] = {}
+
+    async def _fetch_contract_sizes(self):
+        """Fetch contract sizes (contract_value) from Delta API."""
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.PRODUCTS_API) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        products = data.get("result", [])
+                        for product in products:
+                            symbol = product.get("symbol", "")
+                            contract_value = product.get("contract_value", "0")
+                            if symbol and contract_value:
+                                self._contract_sizes[symbol] = float(contract_value)
+                        logger.info(f"Delta: loaded {len(self._contract_sizes)} contract sizes")
+                    else:
+                        logger.warning(f"Delta: failed to fetch contract sizes: HTTP {resp.status}")
+        except Exception as e:
+            logger.warning(f"Delta: failed to fetch contract sizes: {e}")
+
+    def get_contract_size(self, symbol: str) -> float:
+        """Get contract size for a symbol, fallback to 0.001 (BTC default)."""
+        return self._contract_sizes.get(symbol, 0.001)
 
     @property
     def ws_url(self) -> str:
@@ -578,11 +604,55 @@ class DeltaFeed(ExchangeFeed):
             }
         }
 
+    async def connect(self):
+        import websockets
+
+        # Fetch contract sizes on startup
+        await self._fetch_contract_sizes()
+
+        reconnect_delay = 1.0
+        max_reconnects = 10
+        n_reconnects = 0
+
+        while self._running and n_reconnects < max_reconnects:
+            try:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    max_size=10 * 1024 * 1024,
+                ) as ws:
+                    self._ws = ws
+                    n_reconnects = 0
+                    reconnect_delay = 1.0
+
+                    sub_msg = self.build_subscribe_message()
+                    await ws.send(orjson.dumps(sub_msg).decode())
+
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        try:
+                            msg = orjson.loads(raw)
+                            self.process_message(msg)
+                        except Exception as e:
+                            logger.warning(f"Parse error: {e}")
+
+            except Exception as e:
+                if self._running:
+                    logger.warning(f"DeltaFeed WebSocket disconnected: {e}. "
+                                   f"Reconnecting in {reconnect_delay:.1f}s...")
+                    n_reconnects += 1
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 60)
+
     def process_message(self, msg: dict):
         msg_type = msg.get("type")
 
         if msg_type == "trades":
-            trade_norm = normalize_delta_trade(msg)
+            symbol = msg.get("sy", "UNKNOWN")
+            contract_size = self.get_contract_size(symbol)
+            trade_norm = normalize_delta_trade(msg, contract_size)
             if trade_norm and self.on_trade:
                 self.on_trade(trade_norm)
             return

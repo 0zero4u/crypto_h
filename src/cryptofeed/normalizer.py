@@ -325,7 +325,7 @@ def normalize_delta_ob(msg: dict) -> Optional[dict]:
     }
 
 
-def normalize_delta_trade(msg: dict) -> Optional[dict]:
+def normalize_delta_trade(msg: dict, contract_size: float = 0.001) -> Optional[dict]:
     """
     Parse Delta Exchange trades WebSocket message.
 
@@ -361,10 +361,8 @@ def normalize_delta_trade(msg: dict) -> Optional[dict]:
     ts_us = msg.get("t", 0)
     ts_ms = ts_us // 1000 if ts_us > 0 else 0
 
-    # Delta BTCUSD: 1 contract = 0.001 BTC
-    # Convert contracts to base asset quantity
-    CONTRACT_SIZE = 0.001
-    base_qty = size * CONTRACT_SIZE
+    # Convert contracts to base asset quantity using contract_value
+    base_qty = size * contract_size
 
     return {
         "symbol":   msg.get("sy", "UNKNOWN"),
