@@ -18,7 +18,6 @@ from .normalizer import (
     normalize_bybit_trade,
     normalize_delta_ob,
     normalize_delta_trade,
-    normalize_delta_l1,
 )
 from .monitor import LatencyMonitor
 
@@ -283,6 +282,7 @@ class GateIoFeed(ExchangeFeed):
 
     BASE_WS = "wss://fx-ws.gateio.ws/v4/ws/usdt"
     REST_BASE = "https://fx-api.gateio.ws/api/v4/futures/usdt/order_book"
+    CONTRACTS_API = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
     MAX_DEPTH = 20
 
     def __init__(self, symbols: List[str], depth: int = 20,
@@ -295,11 +295,35 @@ class GateIoFeed(ExchangeFeed):
         self._synced: Dict[str, bool] = {s: False for s in symbols}
         self._trade_ws = None
         self._depth_ws = None
+        self._contract_sizes: Dict[str, float] = {}
 
     def _gate_symbol(self, symbol: str) -> str:
         if symbol.endswith("USDT"):
             return symbol[:-4] + "_USDT"
         return symbol
+
+    async def _fetch_contract_sizes(self):
+        """Fetch contract sizes (quanto_multiplier) from Gate.io API."""
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.CONTRACTS_API) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for contract in data:
+                            name = contract.get("name", "")
+                            multiplier = contract.get("quanto_multiplier", "0")
+                            if name and multiplier:
+                                self._contract_sizes[name] = float(multiplier)
+                        logger.info(f"Gate.io: loaded {len(self._contract_sizes)} contract sizes")
+                    else:
+                        logger.warning(f"Gate.io: failed to fetch contract sizes: HTTP {resp.status}")
+        except Exception as e:
+            logger.warning(f"Gate.io: failed to fetch contract sizes: {e}")
+
+    def get_contract_size(self, gate_symbol: str) -> float:
+        """Get contract size for a symbol, fallback to 0.0001 (BTC default)."""
+        return self._contract_sizes.get(gate_symbol, 0.0001)
 
     @property
     def ws_url(self) -> str:
@@ -310,6 +334,9 @@ class GateIoFeed(ExchangeFeed):
 
     async def connect(self):
         import websockets
+
+        # Fetch contract sizes on startup
+        await self._fetch_contract_sizes()
 
         reconnect_delay = 1.0
         max_reconnects = 10
@@ -438,7 +465,9 @@ class GateIoFeed(ExchangeFeed):
 
         if channel == "futures.trades":
             from .normalizer import normalize_gateio_trade
-            trade_norm = normalize_gateio_trade(msg)
+            gate_sym = msg.get("result", [{}])[0].get("contract", "")
+            contract_size = self.get_contract_size(gate_sym)
+            trade_norm = normalize_gateio_trade(msg, contract_size)
             if trade_norm and self.on_trade:
                 self.on_trade(trade_norm)
             return
@@ -521,11 +550,9 @@ class DeltaFeed(ExchangeFeed):
     """
     Delta Exchange WebSocket market data feed.
 
-    Uses ob_l1 channel for best bid/ask updates (~100ms)
-    and trades channel for trade data.
-
-    Since ob_l1 only provides top-of-book, we use mid-price
-    as the fair value instead of DWMP.
+    Uses trades channel only for fair-value computation (last trade price).
+    ob_l1 removed — it updates at ~276ms average (not 100ms as documented),
+    causing stale fair values and false divergence signals.
 
     Endpoint: wss://public-socket.india.delta.exchange
     """
@@ -536,8 +563,6 @@ class DeltaFeed(ExchangeFeed):
                  on_book_update: Optional[Callable] = None,
                  on_trade: Optional[Callable] = None):
         super().__init__(symbols, depth, on_book_update, on_trade)
-        self._last_ts: Dict[str, int] = {}
-        self._mid_prices: Dict[str, float] = {}
 
     @property
     def ws_url(self) -> str:
@@ -548,14 +573,10 @@ class DeltaFeed(ExchangeFeed):
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "ob_l1", "symbols": self.symbols},
                     {"name": "trades", "symbols": self.symbols},
                 ]
             }
         }
-
-    def get_mid_price(self, symbol: str) -> Optional[float]:
-        return self._mid_prices.get(symbol)
 
     def process_message(self, msg: dict):
         msg_type = msg.get("type")
@@ -565,65 +586,3 @@ class DeltaFeed(ExchangeFeed):
             if trade_norm and self.on_trade:
                 self.on_trade(trade_norm)
             return
-
-        if msg_type == "ob_l1":
-            self._handle_l1(msg)
-            return
-
-    def _handle_l1(self, msg: dict):
-        norm = normalize_delta_l1(msg)
-        if not norm:
-            return
-
-        symbol = norm["symbol"]
-        ts_ms = norm["ts_ms"]
-        last_ts = self._last_ts.get(symbol, 0)
-
-        if ts_ms <= last_ts:
-            return
-
-        self._last_ts[symbol] = ts_ms
-        self._mid_prices[symbol] = norm["mid_price"]
-
-        book = self.books.get(symbol)
-        if book:
-            book.apply_snapshot(
-                [(norm["bid"], norm["bid_size"])],
-                [(norm["ask"], norm["ask_size"])],
-                ts_ms, ts_ms
-            )
-
-            ts_ns = time.monotonic_ns()
-            self.monitor.record(symbol, ts_ms, ts_ns)
-            if self.on_book_update:
-                self.on_book_update(book)
-
-    async def _resubscribe(self, symbol: str):
-        if not self._ws:
-            return
-
-        try:
-            unsub_msg = {
-                "type": "unsubscribe",
-                "payload": {
-                    "channels": [
-                        {"name": "ob_l1", "symbols": [symbol]},
-                    ]
-                }
-            }
-            await self._ws.send(orjson.dumps(unsub_msg).decode())
-
-            sub_msg = {
-                "type": "subscribe",
-                "payload": {
-                    "channels": [
-                        {"name": "ob_l1", "symbols": [symbol]},
-                    ]
-                }
-            }
-            await self._ws.send(orjson.dumps(sub_msg).decode())
-            logger.info(f"Delta {symbol}: resubscribed for fresh L1 data")
-        except Exception as e:
-            logger.error(f"Delta {symbol} resubscribe error: {e}")
-
-

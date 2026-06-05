@@ -3,12 +3,13 @@ Main orchestrator for cross-exchange divergence strategy.
 
 Connects BinanceFeed, BybitFeed, (optionally) GateIoFeed, and (optionally) DeltaFeed
 to the strategy pipeline:
-  Book updates → DWMP → GlobalFairValue → Divergence → ZScore → Signal
-  Trade updates → TradeCollector → volume weighting
+  Trade updates → Last Price → GlobalFairValue → Divergence → ZScore → Signal
+  Book updates  → DWMP monitoring only (not used for GFV)
 """
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from typing import List, Optional, Callable, Dict
 
@@ -26,27 +27,26 @@ class DivergenceOrchestrator:
     """
     Orchestrates the cross-exchange divergence strategy.
 
-    Architecture:
-        Binance WS ──► BinanceFeed ──► on_book_update ──► _handle_book
-        Bybit WS   ──► BybitFeed   ──► on_book_update ──► _handle_book
-        Gate.io WS ──► GateIoFeed  ──► on_book_update ──► _handle_book (optional)
-        Delta WS   ──► DeltaFeed   ──► on_book_update ──► _handle_book (optional)
-                                     ──► on_trade       ──► _handle_trade
-                                        │
-                                        ▼
-                                    TradeCollector (1-min volume)
-                                        │
-                                        ▼
-                                    GlobalFairValue (volume-weighted DWMP)
-                                        │
-                                        ▼
-                                    DivergenceTracker (5-min baseline)
-                                        │
-                                        ▼
-                                    ZScoreSignal (threshold=3)
-                                        │
-                                        ▼
-                                    on_signal callback
+    Architecture (trade-price based):
+        Binance WS ──► BinanceFeed ──► on_trade      ──► _handle_trade
+        Bybit WS   ──► BybitFeed   ──► on_trade      ──► _handle_trade
+        Gate.io WS ──► GateIoFeed  ──► on_trade      ──► _handle_trade (optional)
+        Delta WS   ──► DeltaFeed   ──► on_trade      ──► _handle_trade (optional)
+                                         │
+                                         ▼
+                                     TradeCollector (1-min volume)
+                                         │
+                                         ▼
+                                     GlobalFairValue (volume-weighted last price)
+                                         │
+                                         ▼
+                                     DivergenceTracker (3-min baseline)
+                                         │
+                                         ▼
+                                     ZScoreSignal (threshold=2)
+                                         │
+                                         ▼
+                                     on_signal callback
     """
 
     def __init__(
@@ -109,15 +109,18 @@ class DivergenceOrchestrator:
                 on_trade=self._handle_trade,
             )
 
-        # Latest DWMPs per exchange
+        # Latest DWMPs per exchange (for monitoring only)
         self._dwmps: Dict[str, float] = {}
 
     def _handle_trade(self, trade_data: dict):
-        """Process incoming trade from any exchange."""
+        """Process incoming trade — main strategy pipeline."""
+        exchange = trade_data["exchange"]
+        price = trade_data["price"]
+
         trade = Trade(
             symbol=trade_data["symbol"],
-            exchange=trade_data["exchange"],
-            price=trade_data["price"],
+            exchange=exchange,
+            price=price,
             qty=trade_data["qty"],
             ts_ms=trade_data["ts_ms"],
             side=trade_data["side"],
@@ -125,43 +128,36 @@ class DivergenceOrchestrator:
         )
         self.trade_collector.add_trade(trade)
 
-    def _handle_book(self, book: L2OrderBook):
-        """Process order book update — main strategy pipeline."""
-        exchange = self._detect_exchange(book)
-        if not exchange:
-            return
+        # Update GFV with latest trade price (instant, no orderbook lag)
+        self.gfv.update_price(exchange, price)
 
-        # Step 1: Compute DWMP for this exchange
-        dwmp = book.dwmp(n_levels=self.n_levels)
-        if dwmp is None:
-            return
+        # Check for signal immediately
+        self._check_signal(exchange, price)
 
-        self._dwmps[exchange] = dwmp
-        self.gfv.update_dwmp(exchange, dwmp)
-
-        # Step 2: Compute Global Fair Value
+    def _check_signal(self, exchange: str, price: float):
+        """Evaluate divergence and emit signal if threshold exceeded."""
         result = self.gfv.compute()
         if result is None:
             return
 
         gfv, weights = result
+        divergence_pct = (price - gfv) / gfv * 100 if gfv != 0 else 0.0
 
-        # Step 3: Compute divergence for this exchange
-        divergence_pct = (dwmp - gfv) / gfv * 100 if gfv != 0 else 0.0
-        ts_ms = book.exchange_ts_ms or int(__import__('time').time() * 1000)
+        # Update divergence tracker
+        ts_ms = int(time.time() * 1000)
         self.divergence_tracker.record(exchange, divergence_pct, ts_ms)
 
-        # Step 4: Get rolling baseline stats
+        # Get rolling baseline stats
         stats = self.divergence_tracker.get_stats(exchange)
         if stats is None:
             return
 
         mean, std = stats
 
-        # Step 5: Evaluate z-score signal
+        # Evaluate z-score signal
         signal = self.z_score.evaluate(
             exchange=exchange,
-            dwmp=dwmp,
+            dwmp=price,
             gfv=gfv,
             divergence_pct=divergence_pct,
             mean=mean,
@@ -173,10 +169,24 @@ class DivergenceOrchestrator:
             logger.info(
                 f"SIGNAL: {signal.direction.upper()} {exchange} | "
                 f"Z={signal.z_score:.2f} D={signal.divergence_pct:.4f}% | "
-                f"DWMP={signal.dwmp:.2f} GFV={signal.gfv:.2f}"
+                f"Price={price:.2f} GFV={gfv:.2f}"
             )
             if self.on_signal:
                 self.on_signal(signal)
+
+    def _handle_book(self, book: L2OrderBook):
+        """Process order book update — monitoring only, not used for GFV."""
+        exchange = self._detect_exchange(book)
+        if not exchange:
+            return
+
+        dwmp = book.dwmp(n_levels=self.n_levels)
+        if dwmp is not None:
+            self._track_dwmp(exchange, dwmp)
+
+    def _track_dwmp(self, exchange: str, dwmp: float):
+        """Track DWMP per exchange for monitoring purposes."""
+        self._dwmps[exchange] = dwmp
 
     def _detect_exchange(self, book: L2OrderBook) -> Optional[str]:
         """Detect which exchange a book belongs to based on feed ownership."""

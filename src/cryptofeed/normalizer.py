@@ -231,7 +231,7 @@ def normalize_gateio_snapshot(data: dict, symbol: str) -> Optional[dict]:
     }
 
 
-def normalize_gateio_trade(msg: dict) -> Optional[dict]:
+def normalize_gateio_trade(msg: dict, contract_size: float = 0.0001) -> Optional[dict]:
     """
     Parse Gate.io futures.trades message.
 
@@ -265,15 +265,17 @@ def normalize_gateio_trade(msg: dict) -> Optional[dict]:
         return None
 
     symbol = trade.get("contract", "UNKNOWN")
+    
+    # Gate.io uses contracts, convert to base asset using quanto_multiplier
+    qty_base = abs(size) * contract_size
 
     return {
         "symbol":   symbol.replace("_", ""),
         "exchange": "gateio",
         "price":    float(trade["price"]),
-        "qty":      abs(size),
+        "qty":      qty_base,
         "ts_ms":    trade.get("create_time_ms", 0),
         "side":     "buy" if size > 0 else "sell",
-        "volume":   abs(size),
     }
 
 

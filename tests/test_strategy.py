@@ -123,14 +123,14 @@ class TestTradeCollector:
 
 
 class TestGlobalFairValue:
-    """Tests for GlobalFairValue computation."""
+    """Tests for GlobalFairValue computation using last trade prices."""
 
     def test_gfv_single_exchange(self):
         tc = TradeCollector(window_seconds=60)
-        tc.add_trade(make_trade(exchange="binance", price=43200.0, qty=1.0))
+        tc.add_trade(make_trade(exchange="binance", price=43200.5, qty=1.0))
 
         gfv = GlobalFairValue(tc)
-        gfv.update_dwmp("binance", 43200.5)
+        gfv.update_price("binance", 43200.5)
 
         result = gfv.compute()
         assert result is not None
@@ -146,8 +146,8 @@ class TestGlobalFairValue:
         tc.add_trade(make_trade(exchange="bybit", price=43200.0, qty=1.0))
 
         gfv = GlobalFairValue(tc)
-        gfv.update_dwmp("binance", 43200.0)
-        gfv.update_dwmp("bybit", 43300.0)  # Bybit higher
+        gfv.update_price("binance", 43200.0)
+        gfv.update_price("bybit", 43300.0)  # Bybit higher
 
         result = gfv.compute()
         assert result is not None
@@ -160,6 +160,14 @@ class TestGlobalFairValue:
     def test_gfv_no_data(self):
         tc = TradeCollector(window_seconds=60)
         gfv = GlobalFairValue(tc)
+        assert gfv.compute() is None
+
+    def test_gfv_no_volume(self):
+        """GFV should return None if exchange has price but no volume."""
+        tc = TradeCollector(window_seconds=60)
+        gfv = GlobalFairValue(tc)
+        gfv.update_price("binance", 43200.0)
+        # No trades added — volume is 0
         assert gfv.compute() is None
 
 
@@ -304,7 +312,7 @@ class TestGateIoNormalizers:
         assert norm["symbol"] == "BTCUSDT"
         assert norm["exchange"] == "gateio"
         assert norm["price"] == 96.4
-        assert norm["qty"] == 108.0  # abs of -108
+        assert norm["qty"] == 0.0108  # 108 contracts * 0.0001 BTC/contract
         assert norm["side"] == "sell"  # negative = sell
         assert norm["ts_ms"] == 1545136464123
 

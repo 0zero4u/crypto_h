@@ -1,9 +1,9 @@
 """
-Cross-exchange divergence strategy using DWMP fair value.
+Cross-exchange divergence strategy using last-trade-price fair value.
 
 Implements:
 - TradeCollector: rolling volume tracking per exchange
-- GlobalFairValue: volume-weighted DWMP aggregation
+- GlobalFairValue: volume-weighted average of last trade prices
 - DivergenceTracker: rolling mean/std of exchange divergences
 - ZScoreSignal: signal generation when divergence exceeds threshold
 """
@@ -86,20 +86,22 @@ class TradeCollector:
 
 class GlobalFairValue:
     """
-    Computes Global Fair Value (GFV) as volume-weighted average of per-exchange DWMPs.
+    Computes Global Fair Value (GFV) as volume-weighted average of
+    per-exchange last trade prices.
 
-    GFV = sum(DWMP_j * V_j) / sum(V_j)
+    GFV = sum(Price_j * V_j) / sum(V_j)
 
     Where V_j is 1-minute rolling executed volume per exchange.
     """
 
     def __init__(self, trade_collector: TradeCollector):
         self.trade_collector = trade_collector
-        self._dwmps: Dict[str, float] = {}
+        self._prices: Dict[str, float] = {}
 
-    def update_dwmp(self, exchange: str, dwmp: float):
-        """Update DWMP for an exchange."""
-        self._dwmps[exchange] = dwmp
+    def update_price(self, exchange: str, price: float):
+        """Update exchange with latest trade price."""
+        if price > 0:
+            self._prices[exchange] = price
 
     def compute(self) -> Optional[Tuple[float, Dict[str, float]]]:
         """
@@ -109,10 +111,13 @@ class GlobalFairValue:
         """
         volumes = self.trade_collector.get_volumes()
 
-        if not volumes or not self._dwmps:
+        if not volumes or not self._prices:
             return None
 
-        valid_exchanges = [ex for ex in self._dwmps if volumes.get(ex, 0) > 0]
+        valid_exchanges = [
+            ex for ex in self._prices 
+            if volumes.get(ex, 0) > 0 and self._prices[ex] > 0
+        ]
 
         if not valid_exchanges:
             return None
@@ -121,7 +126,7 @@ class GlobalFairValue:
         if total_volume == 0:
             return None
 
-        gfv = sum(self._dwmps[ex] * volumes[ex] for ex in valid_exchanges) / total_volume
+        gfv = sum(self._prices[ex] * volumes[ex] for ex in valid_exchanges) / total_volume
         weights = {ex: volumes[ex] / total_volume for ex in valid_exchanges}
 
         return gfv, weights
@@ -129,9 +134,9 @@ class GlobalFairValue:
 
 class DivergenceTracker:
     """
-    Tracks divergence of each exchange's DWMP from Global Fair Value.
+    Tracks divergence of each exchange's price from Global Fair Value.
 
-    D_j = (DWMP_j - GFV) / GFV * 100  (in percent)
+    D_j = (Price_j - GFV) / GFV * 100  (in percent)
 
     Maintains rolling 3-minute baseline (mean, std) per exchange.
     This absorbs permanent exchange differences (e.g., Bybit naturally +0.03%).
