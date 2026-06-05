@@ -558,33 +558,21 @@ class DeltaFeed(ExchangeFeed):
     """
 
     BASE_WS = "wss://public-socket.india.delta.exchange"
-    PRODUCTS_API = "https://api.delta.exchange/v2/products"
+
+    # Known contract sizes for Delta Exchange (verified against India API)
+    # Format: symbol -> contract_value
+    DELTA_CONTRACT_SIZES = {
+        "BTCUSD": 0.001,   # 1 contract = 0.001 BTC
+        "ETHUSD": 0.01,    # 1 contract = 0.01 ETH
+        "SOLUSD": 1.0,     # 1 contract = 1.0 SOL
+        "XRPUSD": 1.0,     # 1 contract = 1.0 XRP
+    }
 
     def __init__(self, symbols: List[str], depth: int = 1,
                  on_book_update: Optional[Callable] = None,
                  on_trade: Optional[Callable] = None):
         super().__init__(symbols, depth, on_book_update, on_trade)
-        self._contract_sizes: Dict[str, float] = {}
-
-    async def _fetch_contract_sizes(self):
-        """Fetch contract sizes (contract_value) from Delta API."""
-        import aiohttp
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.PRODUCTS_API) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        products = data.get("result", [])
-                        for product in products:
-                            symbol = product.get("symbol", "")
-                            contract_value = product.get("contract_value", "0")
-                            if symbol and contract_value:
-                                self._contract_sizes[symbol] = float(contract_value)
-                        logger.info(f"Delta: loaded {len(self._contract_sizes)} contract sizes")
-                    else:
-                        logger.warning(f"Delta: failed to fetch contract sizes: HTTP {resp.status}")
-        except Exception as e:
-            logger.warning(f"Delta: failed to fetch contract sizes: {e}")
+        self._contract_sizes: Dict[str, float] = dict(self.DELTA_CONTRACT_SIZES)
 
     def get_contract_size(self, symbol: str) -> float:
         """Get contract size for a symbol, fallback to 0.001 (BTC default)."""
@@ -607,8 +595,8 @@ class DeltaFeed(ExchangeFeed):
     async def connect(self):
         import websockets
 
-        # Fetch contract sizes on startup
-        await self._fetch_contract_sizes()
+        # Contract sizes are hardcoded in DELTA_CONTRACT_SIZES
+        # No need to fetch from API (returns wrong values)
 
         reconnect_delay = 1.0
         max_reconnects = 10

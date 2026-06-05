@@ -136,12 +136,17 @@ class DivergenceOrchestrator:
 
     def _check_signal(self, exchange: str, price: float):
         """Evaluate divergence and emit signal if threshold exceeded."""
+        # Use validated price from GFV (rejects price=0)
+        validated_price = self.gfv._prices.get(exchange)
+        if validated_price is None or validated_price <= 0:
+            return
+        
         result = self.gfv.compute()
         if result is None:
             return
 
         gfv, weights = result
-        divergence_pct = (price - gfv) / gfv * 100 if gfv != 0 else 0.0
+        divergence_pct = (validated_price - gfv) / gfv * 100 if gfv != 0 else 0.0
 
         # Update divergence tracker
         ts_ms = int(time.time() * 1000)
@@ -157,7 +162,7 @@ class DivergenceOrchestrator:
         # Evaluate z-score signal
         signal = self.z_score.evaluate(
             exchange=exchange,
-            dwmp=price,
+            dwmp=validated_price,
             gfv=gfv,
             divergence_pct=divergence_pct,
             mean=mean,
@@ -169,7 +174,7 @@ class DivergenceOrchestrator:
             logger.info(
                 f"SIGNAL: {signal.direction.upper()} {exchange} | "
                 f"Z={signal.z_score:.2f} D={signal.divergence_pct:.4f}% | "
-                f"Price={price:.2f} GFV={gfv:.2f}"
+                f"Price={validated_price:.2f} GFV={gfv:.2f}"
             )
             if self.on_signal:
                 self.on_signal(signal)

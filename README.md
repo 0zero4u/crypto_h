@@ -7,7 +7,7 @@ Binance · Bybit · Gate.io · Delta Exchange · DWMP · Z-Score signals
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Production-grade async WebSocket feed handler for crypto market microstructure research. Supports real-time L2 order book reconstruction with incremental diff updates, latency monitoring, and normalized multi-exchange data. Includes a cross-exchange divergence strategy using DWMP fair value and z-score signal generation with fee-adjusted filtering.
+Production-grade async WebSocket feed handler for crypto market microstructure research. Supports real-time L2 order book reconstruction with incremental diff updates, latency monitoring, and normalized multi-exchange data. Includes a cross-exchange divergence strategy using last-trade-price fair value and z-score signal generation with fee-adjusted filtering.
 
 ---
 
@@ -20,8 +20,7 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 │  Binance (fstream.binance.com) ──► BinanceFeed ──► Normalizer ──► L2Book   │
 │  Bybit (stream.bybit.com/v5/public/linear) ──► BybitFeed ──► Normalizer    │
 │  Gate.io (fx-ws.gateio.ws/v4/ws/usdt) ──► GateIoFeed ──► Normalizer        │
-│  Delta (public-socket.india.delta.exchange) ──► DeltaFeed ──► Normalizer    │
-│                (ob_l2 snapshots every 500ms, top 15 levels)                 │
+│  Delta (public-socket.india.delta.exchange) ──► DeltaFeed (trades only)     │
 │                            │                                                │
 │                       LatencyMonitor (µs-precision)                         │
 │                       Price-Sanity Checks (5% deviation)                    │
@@ -32,10 +31,10 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 │                        STRATEGY LAYER                                       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   ┌─────────────┐    ┌──────────────────┐    ┌─────────────────────┐       │
-│   │ DWMP(N=15)  │───►│ GlobalFairValue  │───►│ DivergenceTracker   │       │
-│   │ per exchange │    │ (volume-weighted)│    │ (3-min µ, σ)        │       │
-│   └─────────────┘    └──────────────────┘    └──────────┬──────────┘       │
+│   ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐   │
+│   │ Last Trade Price │───►│ GlobalFairValue  │───►│ DivergenceTracker   │   │
+│   │ per exchange     │    │ (volume-weighted)│    │ (3-min µ, σ)        │   │
+│   └─────────────────┘    └──────────────────┘    └──────────┬──────────┘   │
 │                              ▲                           │                  │
 │                              │                           ▼                  │
 │   ┌──────────────────────────┴──────────┐    ┌─────────────────────┐       │
@@ -58,7 +57,7 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 - **Async WebSocket feeds**: Binance, Bybit, Gate.io, and Delta Exchange futures with auto-reconnect
 - **L2 book reconstruction**: Full snapshot + incremental diff updates
 - **Gate.io sync**: REST snapshot + WebSocket delta merge with sequence ID tracking
-- **Delta Exchange sync**: ob_l2 snapshots every 500ms, top 15 levels, timestamp-based dedup
+- **Delta Exchange sync**: Trades only (removed ob_l1 due to 276ms lag)
 - **SortedDict book**: O(log N) updates, O(1) best bid/ask, depth trimming
 - **Exchange normalizer**: Unified canonical format across venues
 - **Latency monitoring**: P50/P99/P99.9 exchange-to-local latency
@@ -68,8 +67,8 @@ Production-grade async WebSocket feed handler for crypto market microstructure r
 
 ### Divergence Strategy
 
-- **DWMP (Depth-Weighted Mid Price)**: Cross-weights bid/ask volumes for true fair value
-- **Global Fair Value**: Volume-weighted DWMP across exchanges (1-min rolling)
+- **Last Trade Price**: Instant fair value from trade feed (no orderbook lag)
+- **Global Fair Value**: Volume-weighted last trade price across exchanges (1-min rolling)
 - **Divergence Tracking**: Per-exchange rolling baseline (3-min mean/std)
 - **Z-Score Signals**: Automatically absorbs permanent exchange differences
 - **Fee-Adjusted Filtering**: Only signals where |D| > 0.07% AND |Z| > 3
@@ -143,18 +142,18 @@ All exchanges use **futures** markets with **individual trade** streams for fair
 
 ## Strategy Deep Dive
 
-### DWMP Formula
+### Last Trade Price
 
-```
-DWMP = (Σ Bid_i × AskVol_i + Σ Ask_i × BidVol_i) / (Σ BidVol_i + Σ AskVol_i)
-```
+Instead of using orderbook DWMP (which has staleness issues), we use the **last trade price** from each exchange as the fair value. This provides:
 
-Where N=15 levels for Delta (ob_l2 limit), N=20 for other exchanges. Deeper liquidity pulls fair value toward that side.
+- **Instant updates**: No orderbook lag (100-500ms)
+- **Consistent across exchanges**: All use same metric
+- **No staleness**: Trades happen in real-time
 
 ### Global Fair Value
 
 ```
-GFV = Σ(DWMP_j × V_j) / Σ(V_j)
+GFV = Σ(Price_j × V_j) / Σ(V_j)
 ```
 
 Where V_j = 1-minute rolling executed quote volume per exchange.
@@ -162,7 +161,7 @@ Where V_j = 1-minute rolling executed quote volume per exchange.
 ### Divergence
 
 ```
-D_j = (DWMP_j - GFV) / GFV × 100  (percent)
+D_j = (Price_j - GFV) / GFV × 100  (percent)
 ```
 
 ### Z-Score
@@ -250,13 +249,26 @@ Since `ob_l2` provides snapshots (not incremental updates), we use timestamps fo
 
 **Why?** Prevents processing duplicate snapshots when the same data is published multiple times.
 
-### Contract Size Conversion (Delta Exchange)
+### Contract Size Conversion
 
-Delta Exchange trades use contracts, not base asset quantity.
+Exchanges use different units for trade size:
 
-**BTCUSD:** 1 contract = 0.001 BTC
+| Exchange | Unit | Conversion |
+|----------|------|------------|
+| Binance | Base asset (BTC) | None needed |
+| Bybit | Base asset (BTC) | None needed |
+| Gate.io | Contracts | Dynamic from API (`quanto_multiplier`) |
+| Delta | Contracts | Hardcoded per symbol |
 
-**Example:**
+**Gate.io**: Fetches contract sizes from `GET /api/v4/futures/usdt/contracts` on startup. Uses `quanto_multiplier` field.
+
+**Delta**: Uses hardcoded values (API returns wrong values):
+- BTCUSD: 1 contract = 0.001 BTC
+- ETHUSD: 1 contract = 0.01 ETH
+- SOLUSD: 1 contract = 1.0 SOL
+- XRPUSD: 1 contract = 1.0 XRP
+
+**Example (Delta BTCUSD):**
 ```
 Trade: "s": 40.0 (40 contracts)
 Base asset: 40 * 0.001 = 0.04 BTC
